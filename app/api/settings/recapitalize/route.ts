@@ -107,8 +107,11 @@ export async function POST(req: NextRequest) {
                     outputsData: [stringToHex(`CAIT REFUND ${refundCKB.toFixed(2)} CKB`)],
                 });
 
-                await tx.completeInputsByCapacity(tradingSigner);
-                await tx.completeFeeBy(tradingSigner, 1000);
+                // Include cells that have output data (e.g. "CAIT DEPOSIT/BUY/SELL"
+                // memos), because the default filter only matches data-free cells.
+                const cellFilter = { outputDataLenRange: [0, 0xffffffff] as [number, number] };
+                await tx.completeInputsByCapacity(tradingSigner, undefined, cellFilter);
+                await tx.completeFeeBy(tradingSigner, 1000, cellFilter);
                 const refundTxHash = await tradingSigner.sendTransaction(tx);
 
                 console.log(

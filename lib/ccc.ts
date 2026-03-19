@@ -42,8 +42,12 @@ export async function sendCKBWithMemo(
         outputsData: [stringToHex(memo)],
     });
 
-    await tx.completeInputsByCapacity(signer);
-    await tx.completeFeeBy(signer, 1000); // 1000 shannons/KB fee rate
+    // Include cells with output data (CAIT BUY/SELL/DEPOSIT memos) — the
+    // default filter only matches data-free cells, so those memos would be
+    // invisible and the transaction would fail with "Insufficient CKB".
+    const cellFilter = { outputDataLenRange: [0, 0xffffffff] as [number, number] };
+    await tx.completeInputsByCapacity(signer, undefined, cellFilter);
+    await tx.completeFeeBy(signer, 1000, cellFilter); // 1000 shannons/KB fee rate
 
     const txHash = await signer.sendTransaction(tx);
 
