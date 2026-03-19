@@ -18,11 +18,10 @@ import type { AgentSettings, TradingAddress } from "@/lib/supabase";
 
 type Status = "idle" | "saving" | "saved" | "error";
 
-const STEPS = [
-    "Refunding old capital…",
-    "Waiting for wallet approval…",
-    "Saving settings…",
-];
+// Step labels — step 1 (deposit) is conditionally skipped
+const STEP_ADJUST  = "Adjusting capital…";
+const STEP_DEPOSIT = "Waiting for wallet approval…";
+const STEP_SAVE    = "Saving settings…";
 
 function stringToHex(str: string): string {
     const bytes = new TextEncoder().encode(str);
@@ -34,7 +33,7 @@ export default function AgentControls() {
     const [address, setAddress]             = useState<string>("");
     const [isRunning, setIsRunning]         = useState(false);
     const [status, setStatus]               = useState<Status>("idle");
-    const [savingStep, setSavingStep]       = useState(0);
+    const [savingMsg, setSavingMsg]         = useState("");
     const [errorMsg, setErrorMsg]           = useState("");
     const [loading, setLoading]             = useState(true);
     const [tradingWallet, setTradingWallet]     = useState<TradingAddress | null>(null);
@@ -156,55 +155,60 @@ export default function AgentControls() {
 
         setStatus("saving");
         setErrorMsg("");
-        setSavingStep(0);
-
         const newCapital = parseFloat(form.totalCapital);
 
-        // ── Step 1: Refund old capital from trading wallet → user's main wallet ─
+        // ── Step 1: Ask server to compute the delta and handle any refund ────────
+        setSavingMsg(STEP_ADJUST);
+        let adjustAction: "deposit" | "refund_done" | "none";
+        let depositAmount = 0;
         try {
             const res = await fetch("/api/settings/recapitalize", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ wallet_address: address }),
+                body: JSON.stringify({ wallet_address: address, new_capital: newCapital }),
             });
             const json = await res.json();
             if (!res.ok) {
-                setErrorMsg(json.error ?? "Recapitalize failed.");
+                setErrorMsg(json.error ?? "Capital adjustment failed.");
                 setStatus("error");
                 return;
             }
+            adjustAction  = json.action;          // "deposit" | "refund_done" | "none"
+            depositAmount = json.amount ?? 0;     // only set when action === "deposit"
         } catch {
             setErrorMsg("Failed to contact server. Check your connection.");
             setStatus("error");
             return;
         }
 
-        // ── Step 2: User's connected wallet sends new capital → trading wallet ──
-        setSavingStep(1);
-        try {
-            const toScript = await ccc.Address.fromString(
-                tradingWallet.address,
-                signer.client
-            );
-            const amountShannon = ccc.fixedPointFrom(newCapital.toFixed(8));
+        // ── Step 2: Deposit the difference only if the server says so ────────────
+        if (adjustAction === "deposit") {
+            setSavingMsg(STEP_DEPOSIT);
+            try {
+                const toScript = await ccc.Address.fromString(
+                    tradingWallet.address,
+                    signer.client
+                );
+                const amountShannon = ccc.fixedPointFrom(depositAmount.toFixed(8));
 
-            const tx = ccc.Transaction.from({
-                outputs: [{ capacity: amountShannon, lock: toScript.script }],
-                outputsData: [stringToHex(`CAIT DEPOSIT ${newCapital.toFixed(2)} CKB`)],
-            });
+                const tx = ccc.Transaction.from({
+                    outputs: [{ capacity: amountShannon, lock: toScript.script }],
+                    outputsData: [stringToHex(`CAIT DEPOSIT ${depositAmount.toFixed(2)} CKB`)],
+                });
 
-            await tx.completeInputsByCapacity(signer);
-            await tx.completeFeeBy(signer, 1000);
-            await signer.sendTransaction(tx);
-        } catch (e: unknown) {
-            const msg = e instanceof Error ? e.message : String(e);
-            setErrorMsg(`Deposit transaction failed: ${msg}`);
-            setStatus("error");
-            return;
+                await tx.completeInputsByCapacity(signer);
+                await tx.completeFeeBy(signer, 1000);
+                await signer.sendTransaction(tx);
+            } catch (e: unknown) {
+                const msg = e instanceof Error ? e.message : String(e);
+                setErrorMsg(`Deposit transaction failed: ${msg}`);
+                setStatus("error");
+                return;
+            }
         }
 
-        // ── Step 3: Upsert settings + reset all stats ────────────────────────────
-        setSavingStep(2);
+        // ── Step 3: Upsert settings ───────────────────────────────────────────────
+        setSavingMsg(STEP_SAVE);
         const payload: AgentSettings & Record<string, unknown> = {
             wallet_address: address,
             likely_buy_price: parseFloat(form.likelyBuyPrice),
@@ -233,6 +237,8 @@ export default function AgentControls() {
         } else {
             setIsRunning(false);
             setStatus("saved");
+            // Refresh balance display
+            if (tradingWallet?.address) fetchBalance(tradingWallet.address);
             setTimeout(() => setStatus("idle"), 3500);
         }
     }
@@ -429,10 +435,7 @@ export default function AgentControls() {
                 {status === "saving" && (
                     <div className="flex items-center gap-2 text-cyan-400 text-xs bg-cyan-400/10 border border-cyan-400/20 rounded-lg px-3 py-2">
                         <Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin" />
-                        <span>
-                            <span className="text-white/30 mr-1.5">Step {savingStep + 1}/{STEPS.length}</span>
-                            {STEPS[savingStep]}
-                        </span>
+                        {savingMsg}
                     </div>
                 )}
 

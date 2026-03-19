@@ -97,15 +97,15 @@ export default function AgentStats() {
         ) : (
           <div className="grid grid-cols-2 gap-3">
 
-            {/* On-chain balance (source of truth) */}
+            {/* Total capital — DB value (synced from on-chain by the agent) */}
             <StatTile
               icon={<Wallet className="w-3.5 h-3.5 text-cyan-400" />}
-              label="Wallet Balance"
-              value={onChainBalance !== null
-                ? `${onChainBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} CKB`
-                : "—"
+              label="Total Capital"
+              value={`${(settings.total_capital ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} CKB`}
+              sub={onChainBalance !== null && onChainBalance > 0
+                ? `${onChainBalance.toFixed(2)} CKB on-chain`
+                : "available to trade"
               }
-              sub="live on-chain balance"
               color="text-cyan-300"
             />
 
