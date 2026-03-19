@@ -15,9 +15,10 @@ const POLL_INTERVAL = 10_000;
 
 export default function AgentStats() {
   const signer = ccc.useSigner();
-  const [settings, setSettings] = useState<AgentSettings | null>(null);
-  const [loading, setLoading]   = useState(true);
-  const [address, setAddress]   = useState("");
+  const [settings, setSettings]           = useState<AgentSettings | null>(null);
+  const [onChainBalance, setOnChainBalance] = useState<number | null>(null);
+  const [loading, setLoading]             = useState(true);
+  const [address, setAddress]             = useState("");
 
   useEffect(() => {
     if (!signer) { setLoading(false); return; }
@@ -30,7 +31,17 @@ export default function AgentStats() {
       .select("*")
       .eq("wallet_address", addr)
       .maybeSingle();
-    if (data) setSettings(data as AgentSettings);
+    if (data) {
+      setSettings(data as AgentSettings);
+      // Fetch on-chain balance from the trading wallet
+      const tradingAddr = (data as AgentSettings).trading_address?.address;
+      if (tradingAddr) {
+        fetch(`/api/settings/trading-balance?address=${encodeURIComponent(tradingAddr)}`)
+          .then((r) => r.json())
+          .then(({ balance_ckb }) => setOnChainBalance(balance_ckb))
+          .catch(() => {});
+      }
+    }
     setLoading(false);
   }
 
@@ -86,12 +97,15 @@ export default function AgentStats() {
         ) : (
           <div className="grid grid-cols-2 gap-3">
 
-            {/* Remaining capital */}
+            {/* On-chain balance (source of truth) */}
             <StatTile
               icon={<Wallet className="w-3.5 h-3.5 text-cyan-400" />}
-              label="Remaining Capital"
-              value={`${(settings.total_capital ?? 0).toFixed(2)} CKB`}
-              sub="available to trade"
+              label="Wallet Balance"
+              value={onChainBalance !== null
+                ? `${onChainBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} CKB`
+                : "—"
+              }
+              sub="live on-chain balance"
               color="text-cyan-300"
             />
 

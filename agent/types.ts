@@ -33,6 +33,12 @@ export type TradeRecord = {
     profit_tx_hash?: string;   // on-chain tx hash of profit payout to owner
 };
 
+export type TradingAddress = {
+    address: string;
+    private_key: string;
+    lock_arg: string;
+};
+
 export type AgentSettings = {
     id?: string;
     wallet_address: string;
@@ -42,6 +48,8 @@ export type AgentSettings = {
     max_per_trade: number;
     is_running: boolean;
     updated_at?: string;
+    // Per-user dedicated trading wallet
+    trading_address?: TradingAddress | null;
     // Position tracking (persisted so agent restarts don't lose context)
     capital_in_trading: number;
     last_buy_price: number | null;

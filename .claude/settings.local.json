@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__ckb-ai__search_tools",
+      "mcp__ckb-ai__search_resources"
+    ]
+  }
+}
