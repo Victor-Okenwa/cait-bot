@@ -7,10 +7,37 @@ export type PricePoint = {
 const priceHistory: PricePoint[] = [];
 const MAX_HISTORY = 30;
 
+// Retry with exponential backoff — handles CoinGecko rate limits (429)
+async function fetchWithRetry(
+    url: string,
+    maxAttempts = 3,
+    baseDelayMs = 2000
+): Promise<Response> {
+    let lastErr: Error = new Error("Unknown error");
+    for (let i = 0; i < maxAttempts; i++) {
+        try {
+            const res = await fetch(url, { cache: "no-store" });
+            if (res.status === 429 || res.status >= 500) {
+                lastErr = new Error(`CoinGecko ${res.status}`);
+                if (i < maxAttempts - 1) {
+                    await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, i)));
+                    continue;
+                }
+            }
+            return res;
+        } catch (e: any) {
+            lastErr = e;
+            if (i < maxAttempts - 1) {
+                await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, i)));
+            }
+        }
+    }
+    throw lastErr;
+}
+
 export async function fetchCKBPrice(): Promise<number> {
-    const res = await fetch(
-      "https://api.coingecko.com/api/v3/simple/price?ids=nervos-network&vs_currencies=usd",
-      { cache: "no-store" }
+    const res = await fetchWithRetry(
+        "https://api.coingecko.com/api/v3/simple/price?ids=nervos-network&vs_currencies=usd"
     );
 
     if (!res.ok) {

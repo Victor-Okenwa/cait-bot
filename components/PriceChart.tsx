@@ -159,17 +159,56 @@ function CandleTooltip({ active, payload, label, prec }: any) {
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
+// ─── Retry fetch helper ───────────────────────────────────────────────────────
+// Retries up to `maxAttempts` times with exponential backoff.
+async function fetchWithRetry(
+  url: string,
+  maxAttempts = 3,
+  baseDelayMs = 1500
+): Promise<Response> {
+  let lastError: Error = new Error("Unknown fetch error");
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      const res = await fetch(url);
+      // Retry on 429 (rate limit) or 5xx server errors
+      if (res.status === 429 || res.status >= 500) {
+        lastError = new Error(
+          res.status === 429 ? "Rate limited — retrying…" : `Server error ${res.status}`
+        );
+        if (attempt < maxAttempts - 1) {
+          await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, attempt)));
+          continue;
+        }
+      }
+      return res;
+    } catch (e: any) {
+      lastError = e;
+      if (attempt < maxAttempts - 1) {
+        await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, attempt)));
+      }
+    }
+  }
+  throw lastError;
+}
+
 export default function PriceChart() {
   const [chartType,        setChartType]        = useState<ChartType>("line");
   const [selectedDuration, setSelectedDuration] = useState<DurationKey>("1h");
   const [chartData,        setChartData]        = useState<ChartPoint[]>([]);
   const [currentPrice,     setCurrentPrice]     = useState<number | null>(null);
   const [loading,          setLoading]          = useState(true);
+  const [refetching,       setRefetching]       = useState(false);
   const [error,            setError]            = useState<string | null>(null);
   const [isFullscreen,     setIsFullscreen]     = useState(false);
 
-  const liveBuffer   = useRef<LivePoint[]>([]);
-  const containerRef = useRef<HTMLDivElement>(null);
+  const liveBuffer    = useRef<LivePoint[]>([]);
+  const containerRef  = useRef<HTMLDivElement>(null);
+  // Track current duration+type for manual refetch
+  const durRef        = useRef<DurationKey>("1h");
+  const typeRef       = useRef<ChartType>("line");
+
+  useEffect(() => { durRef.current  = selectedDuration; }, [selectedDuration]);
+  useEffect(() => { typeRef.current = chartType;        }, [chartType]);
 
   // ── Fullscreen ──────────────────────────────────────────────────────────────
 
@@ -192,9 +231,8 @@ export default function PriceChart() {
   function rebuildFromBuffer(dur: DurationKey, type: ChartType) {
     const cfg = DURATIONS[dur];
     if (!cfg.live || !cfg.windowMs) return;
-    const cutoff  = Date.now() - cfg.windowMs;
+    const cutoff   = Date.now() - cfg.windowMs;
     const filtered = liveBuffer.current.filter((p) => p.ts >= cutoff);
-
     if (type === "candle") {
       setChartData(aggregateCandles(filtered));
     } else {
@@ -202,18 +240,16 @@ export default function PriceChart() {
     }
   }
 
-  // ── Historical: line/area ───────────────────────────────────────────────────
+  // ── Historical: line/area — uses /api/price proxy ───────────────────────────
 
   async function fetchHistoricalLine(days: number) {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(
-        `https://api.coingecko.com/api/v3/coins/nervos-network/market_chart?vs_currency=usd&days=${days}`,
-        { cache: "no-store" }
-      );
-      if (!res.ok) throw new Error(`CoinGecko ${res.status}`);
+      const res = await fetchWithRetry(`/api/price?type=chart&days=${days}`);
+      if (!res.ok) throw new Error(`Price API ${res.status}`);
       const json = await res.json();
+      if (json.error) throw new Error(json.error);
       const prices: [number, number][] = json.prices ?? [];
       const step    = Math.max(1, Math.floor(prices.length / 120));
       const sampled = prices.filter((_, i) => i % step === 0);
@@ -226,25 +262,20 @@ export default function PriceChart() {
     }
   }
 
-  // ── Historical: candle ──────────────────────────────────────────────────────
+  // ── Historical: candle — uses /api/price proxy ───────────────────────────────
 
   async function fetchHistoricalOHLC(days: number) {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(
-        `https://api.coingecko.com/api/v3/coins/nervos-network/ohlc?vs_currency=usd&days=${days}`,
-        { cache: "no-store" }
-      );
-      if (!res.ok) throw new Error(`CoinGecko OHLC ${res.status}`);
+      const res = await fetchWithRetry(`/api/price?type=ohlc&days=${days}`);
+      if (!res.ok) throw new Error(`Price API ${res.status}`);
       const raw: [number, number, number, number, number][] = await res.json();
       const step    = Math.max(1, Math.floor(raw.length / 120));
       const sampled = raw.filter((_, i) => i % step === 0);
-      const points: CandlePoint[] = sampled.map(([ts, o, h, l, c]) => ({
-        time:  fmtHistTime(ts, days),
-        open:  o, high: h, low: l, close: c,
-      }));
-      setChartData(points);
+      setChartData(sampled.map(([ts, o, h, l, c]) => ({
+        time: fmtHistTime(ts, days), open: o, high: h, low: l, close: c,
+      })));
       if (raw.length) setCurrentPrice(raw[raw.length - 1][4]);
     } catch (e: any) {
       setError(e.message ?? "Fetch failed");
@@ -253,16 +284,15 @@ export default function PriceChart() {
     }
   }
 
-  // ── Live price polling ──────────────────────────────────────────────────────
+  // ── Live price polling — uses /api/price proxy ──────────────────────────────
 
-  async function fetchLivePrice() {
+  async function fetchLivePrice(isManual = false) {
+    if (isManual) setRefetching(true);
     try {
-      const res = await fetch(
-        "https://api.coingecko.com/api/v3/simple/price?ids=nervos-network&vs_currencies=usd",
-        { cache: "no-store" }
-      );
-      if (!res.ok) throw new Error(`CoinGecko ${res.status}`);
+      const res = await fetchWithRetry("/api/price?type=simple");
+      if (!res.ok) throw new Error(`Price API ${res.status}`);
       const json  = await res.json();
+      if (json.error) throw new Error(json.error);
       const price = json["nervos-network"]?.usd as number;
       if (!price) throw new Error("No price in response");
 
@@ -272,7 +302,6 @@ export default function PriceChart() {
       setCurrentPrice(price);
       setError(null);
 
-      // Rebuild live chart in-place without triggering the duration/type effect
       setSelectedDuration((dur) => {
         if (DURATIONS[dur].live) {
           setChartType((type) => { rebuildFromBuffer(dur, type); return type; });
@@ -283,6 +312,29 @@ export default function PriceChart() {
       setError(e.message ?? "Fetch failed");
     } finally {
       setLoading(false);
+      if (isManual) setRefetching(false);
+    }
+  }
+
+  // ── Manual refetch (button) ───────────────────────────────────────────────
+
+  async function handleManualRefetch() {
+    const dur  = durRef.current;
+    const type = typeRef.current;
+    const cfg  = DURATIONS[dur];
+
+    setRefetching(true);
+    setError(null);
+
+    if (cfg.live) {
+      await fetchLivePrice(true);
+    } else {
+      if (type === "candle") {
+        await fetchHistoricalOHLC(cfg.days!);
+      } else {
+        await fetchHistoricalLine(cfg.days!);
+      }
+      setRefetching(false);
     }
   }
 
@@ -472,10 +524,14 @@ export default function PriceChart() {
             </CardTitle>
 
             <div className="flex items-center gap-2 flex-wrap">
-              {loading ? (
+              {loading && !refetching ? (
                 <Skeleton className="h-6 w-24 bg-white/10" />
               ) : error ? (
-                <Badge variant="destructive" className="text-xs">{error}</Badge>
+                <div className="flex items-center gap-1.5">
+                  <Badge variant="destructive" className="text-xs max-w-[160px] truncate">
+                    {error}
+                  </Badge>
+                </div>
               ) : (
                 <div className="flex items-center gap-1.5">
                   <TrendIcon className={`w-4 h-4 ${trendColor}`} />
@@ -488,6 +544,16 @@ export default function PriceChart() {
               <Badge variant="outline" className="text-[10px] border-white/20 text-white/40">
                 CoinGecko
               </Badge>
+
+              {/* Refetch button */}
+              <button
+                onClick={handleManualRefetch}
+                disabled={refetching}
+                title="Refetch price data"
+                className="flex items-center justify-center w-7 h-7 rounded-md border border-white/10 bg-white/5 hover:bg-white/10 text-white/50 hover:text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${refetching ? "animate-spin" : ""}`} />
+              </button>
 
               {/* Fullscreen button */}
               <button

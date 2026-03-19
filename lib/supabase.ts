@@ -25,6 +25,15 @@ export type AgentSettings = {
     max_per_trade: number;
     is_running: boolean;
     updated_at?: string;
+    // Position tracking (persisted so agent restarts don't lose context)
+    capital_in_trading: number;
+    last_buy_price: number | null;
+    last_buy_amount: number | null;
+    // Stats
+    win_count: number;
+    loss_count: number;
+    martingale_count: number;
+    total_pnl_ckb: number;
 };
 
 export type Trade = {
