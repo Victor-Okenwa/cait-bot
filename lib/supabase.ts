@@ -38,4 +38,7 @@ export type Trade = {
     martingale: boolean;
     tx_hash?: string;
     explorer_link?: string;
+    pnl_ckb?: number | null;
+    pnl_usd?: number | null;
+    profit_tx_hash?: string | null;
 };

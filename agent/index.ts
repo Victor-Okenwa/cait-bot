@@ -64,6 +64,7 @@ function getOrInitState(settings: AgentSettings): {
                 lastTradeWasLoss: false,
                 consecutiveLosses: 0,
                 lastBuyPrice: null,
+                lastBuyAmount: null,
             },
         });
     }
@@ -203,27 +204,55 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
         // Still log the trade attempt                                                                                             
     }
 
-    // Determine if last trade was a loss (for Martingale update)                                                                
-    let wasLoss = false;
-    if (isSell && agentState.lastBuyPrice !== null) {
-        wasLoss = currentPrice < agentState.lastBuyPrice;
+    // ── P&L calculation (only on sell) ───────────────────────────────────────
+    let pnl_usd: number | null = null;
+    let pnl_ckb: number | null = null;
+    let profit_tx_hash: string | undefined;
+
+    if (isSell && agentState.lastBuyPrice !== null && agentState.lastBuyAmount !== null) {
+        pnl_usd = agentState.lastBuyAmount * (currentPrice - agentState.lastBuyPrice);
+        pnl_ckb = pnl_usd / currentPrice;
+        const sign = pnl_usd >= 0 ? "+" : "";
+        console.log(`📈  P&L: ${sign}${pnl_usd.toFixed(4)} USD  (${sign}${pnl_ckb.toFixed(2)} CKB)`);
+
+        if (pnl_ckb > 61) {
+            const profitMemo = `CAIT PROFIT ${pnl_ckb.toFixed(2)} CKB | P&L $${pnl_usd.toFixed(4)}`;
+            try {
+                const profitResult = await sendCKBWithMemo(signer, addr, pnl_ckb, profitMemo);
+                profit_tx_hash = profitResult.txHash;
+                console.log(`💸  Profit sent to owner: ${profitResult.txHash}`);
+            } catch (err) {
+                console.error("❌  Profit payout TX failed:", err);
+            }
+        } else if (pnl_ckb > 0) {
+            console.log(`ℹ️   Profit ${pnl_ckb.toFixed(2)} CKB below 61 CKB minimum — skipping payout.`);
+        } else {
+            console.log(`📉  Loss trade — no profit payout.`);
+        }
     }
 
-    // Update state                                                                                                              
+    // ── Martingale: was this a loss? ──────────────────────────────────────────
+    const wasLoss = isSell && agentState.lastBuyPrice !== null
+        ? currentPrice < agentState.lastBuyPrice
+        : false;
+
+    // ── Update in-memory state ────────────────────────────────────────────────
     if (isBuy) {
         agentState.remainingCapital -= amount;
-        agentState.lastBuyPrice = currentPrice;
+        agentState.lastBuyPrice  = currentPrice;
+        agentState.lastBuyAmount = amount;
     } else if (isSell) {
         agentState.remainingCapital += amount;
-        agentState.lastBuyPrice = null;
+        agentState.lastBuyPrice  = null;
+        agentState.lastBuyAmount = null;
     }
 
     const updatedMartingale = updateMartingaleState(martingale, wasLoss);
-    agentState.lastTradeWasLoss = wasLoss;
+    agentState.lastTradeWasLoss  = wasLoss;
     agentState.consecutiveLosses = updatedMartingale.consecutiveLosses;
     stateMap.set(addr, { martingale: updatedMartingale, agentState });
 
-    // Persist trade                                                                                                             
+    // ── Persist trade ─────────────────────────────────────────────────────────
     await saveTrade({
         wallet_address: addr,
         type: isBuy ? "buy" : "sell",
@@ -233,16 +262,19 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
         martingale: isMartingale,
         tx_hash: txHash,
         explorer_link: explorerLink,
+        pnl_ckb,
+        pnl_usd,
+        profit_tx_hash,
     });
 
-    // Update remaining capital in settings                                                                                      
+    // ── Update remaining capital ──────────────────────────────────────────────
     await db
         .from("agent_settings")
         .update({ total_capital: agentState.remainingCapital, updated_at: new Date().toISOString() })
         .eq("wallet_address", addr);
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────                                               
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function saveTrade(trade: {
     wallet_address: string;
@@ -253,6 +285,9 @@ async function saveTrade(trade: {
     martingale: boolean;
     tx_hash?: string;
     explorer_link?: string;
+    pnl_ckb?: number | null;
+    pnl_usd?: number | null;
+    profit_tx_hash?: string;
 }) {
     const { error } = await db.from("trades").insert({
         ...trade,

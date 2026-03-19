@@ -28,6 +28,9 @@ export type TradeRecord = {
     martingale: boolean;
     tx_hash?: string;
     explorer_link?: string;
+    pnl_ckb?: number;          // profit/loss in CKB (null for buy/hold/wait)
+    pnl_usd?: number;          // profit/loss in USD
+    profit_tx_hash?: string;   // on-chain tx hash of profit payout to owner
 };
 
 export type AgentSettings = {
@@ -48,4 +51,5 @@ export type AgentState = {
     lastTradeWasLoss: boolean;
     consecutiveLosses: number;
     lastBuyPrice: number | null;
+    lastBuyAmount: number | null;  // CKB amount of the last buy (for P&L calc)
 };

@@ -13,13 +13,13 @@ import {
     TableHeader,
     TableRow,
 } from "@/components/ui/table";
-import { ExternalLink, History } from "lucide-react";
+import { ExternalLink, History, TrendingUp, TrendingDown } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import type { Trade } from "@/lib/supabase";
 
 const POLL_INTERVAL = 15_000; // 15 seconds
 
-type TradeRow = Trade & { id: string; timestamp: string };
+type TradeRow = Trade & { id: string; timestamp: string; pnl_ckb?: number | null; pnl_usd?: number | null; profit_tx_hash?: string | null };
 
 const TYPE_STYLES: Record<string, string> = {
     buy: "bg-emerald-400/15 text-emerald-400 border-emerald-400/30",
@@ -139,6 +139,9 @@ export default function TradeLog() {
                                     <TableHead className="text-white/40 text-xs font-medium w-20 text-center">
                                         Martingale
                                     </TableHead>
+                                    <TableHead className="text-white/40 text-xs font-medium w-32 text-right">
+                                        P&amp;L (CKB)
+                                    </TableHead>
                                     <TableHead className="text-white/40 text-xs font-medium w-16 text-center">
                                         TX
                                     </TableHead>
@@ -193,14 +196,47 @@ export default function TradeLog() {
                                             )}
                                         </TableCell>
 
+                                        {/* P&L column */}
+                                        <TableCell className="py-2.5 text-right">
+                                            {trade.type === "sell" && trade.pnl_ckb != null ? (
+                                                <div className="flex flex-col items-end gap-0.5">
+                                                    <div className={`flex items-center gap-1 text-sm font-mono font-semibold ${trade.pnl_ckb >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                                                        {trade.pnl_ckb >= 0
+                                                            ? <TrendingUp className="w-3 h-3" />
+                                                            : <TrendingDown className="w-3 h-3" />}
+                                                        {trade.pnl_ckb >= 0 ? "+" : ""}{trade.pnl_ckb.toFixed(2)}
+                                                    </div>
+                                                    {trade.pnl_usd != null && (
+                                                        <span className={`text-[10px] font-mono ${trade.pnl_usd >= 0 ? "text-emerald-400/60" : "text-red-400/60"}`}>
+                                                            {trade.pnl_usd >= 0 ? "+" : ""}${trade.pnl_usd.toFixed(4)}
+                                                        </span>
+                                                    )}
+                                                    {trade.profit_tx_hash && (
+                                                        <a
+                                                            href={`https://testnet.explorer.nervos.org/transaction/${trade.profit_tx_hash}`}
+                                                            target="_blank"
+                                                            rel="noopener noreferrer"
+                                                            className="text-[10px] text-cyan-400/60 hover:text-cyan-300 flex items-center gap-0.5"
+                                                            title="Profit payout TX"
+                                                        >
+                                                            <ExternalLink className="w-2.5 h-2.5" />
+                                                            payout
+                                                        </a>
+                                                    )}
+                                                </div>
+                                            ) : (
+                                                <span className="text-white/20 text-xs">—</span>
+                                            )}
+                                        </TableCell>
+
+                                        {/* Trade TX */}
                                         <TableCell className="py-2.5 text-center">
                                             {trade.tx_hash && trade.explorer_link ? (
                                                 <a
                                                     href={trade.explorer_link}
                                                     target="_blank"
                                                     rel="noopener noreferrer"
-                                                    className="inline-flex items-center justify-center text-cyan-400 hover:text-cyan-300
-  transition-colors"
+                                                    className="inline-flex items-center justify-center text-cyan-400 hover:text-cyan-300 transition-colors"
                                                     title={trade.tx_hash}
                                                 >
                                                     <ExternalLink className="w-3.5 h-3.5" />
