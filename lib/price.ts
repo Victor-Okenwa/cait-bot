@@ -9,8 +9,8 @@ const MAX_HISTORY = 30;
 
 export async function fetchCKBPrice(): Promise<number> {
     const res = await fetch(
-        "https://api.coingecko.com/api/v3/simple/price?ids=nervos-network&vs_currencies = usd",                                                                 
-      { next: { revalidate: 0 } }
+      "https://api.coingecko.com/api/v3/simple/price?ids=nervos-network&vs_currencies=usd",
+      { cache: "no-store" }
     );
 
     if (!res.ok) {
