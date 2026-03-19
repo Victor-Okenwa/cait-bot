@@ -3,6 +3,7 @@
 import WalletConnect from "@/components/WalletConnect";
 import PriceChart from "@/components/PriceChart";
 import AgentControls from "@/components/AgentControls";
+import AgentStats from "@/components/AgentStats";
 import TradeLog from "@/components/TradeLog";
 import { Badge } from "@/components/ui/badge";
 import { Bot, Cpu, Zap } from "lucide-react";
@@ -78,8 +79,9 @@ export default function Home() {
 
         {/* Agent controls + Trade log — 2 col on large screens */}
         <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
-          <div className="lg:col-span-2">
+          <div className="lg:col-span-2 flex flex-col gap-6">
             <AgentControls />
+            <AgentStats />
           </div>
           <div className="lg:col-span-3">
             <TradeLog />

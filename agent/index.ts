@@ -63,10 +63,17 @@ function getOrInitState(settings: AgentSettings): {
                 lastDecision: null,
                 lastTradeWasLoss: false,
                 consecutiveLosses: 0,
-                lastBuyPrice: null,
-                lastBuyAmount: null,
+                // ── Restore open position from DB so restarts don't lose context ──
+                lastBuyPrice:  settings.last_buy_price  ?? null,
+                lastBuyAmount: settings.last_buy_amount ?? null,
             },
         });
+
+        if (settings.last_buy_price) {
+            console.log(
+                `♻️   Restored open position: bought ${settings.last_buy_amount?.toFixed(2)} CKB @ $${settings.last_buy_price.toFixed(6)}`
+            );
+        }
     }
     return stateMap.get(key)!;
 }
@@ -267,10 +274,41 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
         profit_tx_hash,
     });
 
-    // ── Update remaining capital ──────────────────────────────────────────────
+    // ── Persist stats + position to DB ───────────────────────────────────────
+    const dbUpdate: Record<string, unknown> = {
+        updated_at: new Date().toISOString(),
+        total_capital: agentState.remainingCapital,
+    };
+
+    if (isBuy) {
+        dbUpdate.capital_in_trading = (settings.capital_in_trading ?? 0) + amount;
+        dbUpdate.last_buy_price     = currentPrice;
+        dbUpdate.last_buy_amount    = amount;
+    }
+
+    if (isSell) {
+        dbUpdate.capital_in_trading = 0;
+        dbUpdate.last_buy_price     = null;
+        dbUpdate.last_buy_amount    = null;
+        // Win/loss counters
+        if (wasLoss) {
+            dbUpdate.loss_count = (settings.loss_count ?? 0) + 1;
+        } else {
+            dbUpdate.win_count = (settings.win_count ?? 0) + 1;
+        }
+        // Running P&L total
+        if (pnl_ckb !== null) {
+            dbUpdate.total_pnl_ckb = (settings.total_pnl_ckb ?? 0) + pnl_ckb;
+        }
+    }
+
+    if (isMartingale) {
+        dbUpdate.martingale_count = (settings.martingale_count ?? 0) + 1;
+    }
+
     await db
         .from("agent_settings")
-        .update({ total_capital: agentState.remainingCapital, updated_at: new Date().toISOString() })
+        .update(dbUpdate)
         .eq("wallet_address", addr);
 }
 
