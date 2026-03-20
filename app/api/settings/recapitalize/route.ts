@@ -1,31 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createServiceClient } from "@/lib/supabase";
 import { getAddressBalanceCKB } from "@/lib/balance";
-import { ccc } from "@ckb-ccc/core";
-import type { TradingAddress } from "@/lib/supabase";
 
-const EXPLORER_BASE = "https://testnet.explorer.nervos.org/transaction";
-// Minimum CKB for a cell output — transfers below this aren't possible on-chain
-const MIN_TRANSFER_CKB = 61;
-// Buffer left in trading wallet to cover the refund tx fee (~0.001 CKB typical)
-const FEE_BUFFER_CKB = 0.1;
+const MIN_DEPOSIT_CKB = 60;
 
 /**
  * POST /api/settings/recapitalize
  * Body: { wallet_address: string, new_capital: number }
  *
- * Computes the delta between the trading wallet's actual on-chain balance and
- * the desired new_capital, then acts on it:
+ * new_capital is the AMOUNT TO DEPOSIT this session (not the desired total):
  *
- *   delta > MIN_TRANSFER → action: "deposit"
- *     No server tx. Client must send `amount` CKB to the trading wallet.
+ *   new_capital === 0
+ *     No deposit. Client may still save other settings.  → action: "none"
  *
- *   delta < -MIN_TRANSFER → action: "refund_done"
- *     Server sends the excess back to the user's main wallet.
- *     No further client tx needed.
+ *   0 < new_capital < 60
+ *     Below on-chain minimum cell size. Rejected.        → HTTP 400
  *
- *   |delta| < MIN_TRANSFER → action: "none"
- *     Balances already match within the transfer minimum. No tx needed.
+ *   new_capital >= 60
+ *     Verify the owner wallet can cover the amount, then tell the
+ *     client to send that many CKB to the trading wallet.  → action: "deposit"
  */
 export async function POST(req: NextRequest) {
     let body: { wallet_address: string; new_capital: number };
@@ -42,109 +34,35 @@ export async function POST(req: NextRequest) {
         );
     }
 
-    const db = createServiceClient();
-
-    const { data: settings, error: fetchErr } = await db
-        .from("agent_settings")
-        .select("capital_in_trading, trading_address")
-        .eq("wallet_address", body.wallet_address)
-        .maybeSingle();
-
-    if (fetchErr) {
-        return NextResponse.json({ error: fetchErr.message }, { status: 500 });
+    // 0 → user only wants to update settings, no deposit needed
+    if (body.new_capital === 0) {
+        return NextResponse.json({ action: "none" });
     }
 
-    if (settings && (settings.capital_in_trading ?? 0) > 0) {
+    // Below minimum cell size
+    if (body.new_capital < MIN_DEPOSIT_CKB) {
         return NextResponse.json(
             {
                 error:
-                    "Cannot change capital while the agent has an open trade position. " +
-                    "Wait for the agent to sell first.",
+                    `Deposit amount must be at least ${MIN_DEPOSIT_CKB} CKB. ` +
+                    `Enter 0 to update settings without depositing.`,
             },
-            { status: 409 }
+            { status: 400 }
         );
     }
 
-    const tradingInfo = settings?.trading_address as TradingAddress | null;
-
-    // ── Read actual on-chain balance ──────────────────────────────────────────
-    const onChainBalance = tradingInfo?.address
-        ? await getAddressBalanceCKB(tradingInfo.address)
-        : 0;
-
-    console.log(
-        `[recapitalize] on-chain: ${onChainBalance.toFixed(4)} CKB  |  requested: ${body.new_capital} CKB`
-    );
-
-    const delta = body.new_capital - onChainBalance; // positive = need to deposit, negative = need to refund
-
-    // ── Case 1: Need to deposit more (delta is positive and large enough) ─────
-    if (delta >= MIN_TRANSFER_CKB) {
-        return NextResponse.json({
-            action: "deposit",
-            amount: delta,
-            on_chain_balance: onChainBalance,
-        });
+    // Verify the owner wallet has enough CKB to cover the deposit
+    const ownerBalance = await getAddressBalanceCKB(body.wallet_address);
+    if (ownerBalance < body.new_capital) {
+        return NextResponse.json(
+            {
+                error:
+                    `Insufficient balance. Your wallet has ${ownerBalance.toFixed(2)} CKB ` +
+                    `but you are trying to deposit ${body.new_capital} CKB.`,
+            },
+            { status: 400 }
+        );
     }
 
-    // ── Case 2: Need to refund excess (delta is negative and large enough) ────
-    if (delta <= -MIN_TRANSFER_CKB && tradingInfo?.private_key) {
-        const refundCKB = Math.abs(delta) - FEE_BUFFER_CKB;
-
-        if (refundCKB >= MIN_TRANSFER_CKB) {
-            try {
-                const client = new ccc.ClientPublicTestnet();
-                const tradingSigner = new ccc.SignerCkbPrivateKey(client, tradingInfo.private_key);
-                const toScript = await ccc.Address.fromString(body.wallet_address, client);
-
-                const tx = ccc.Transaction.from({
-                    outputs: [
-                        {
-                            capacity: ccc.fixedPointFrom(refundCKB.toFixed(8)),
-                            lock: toScript.script,
-                        },
-                    ],
-                    outputsData: [stringToHex(`CAIT REFUND ${refundCKB.toFixed(2)} CKB`)],
-                });
-
-                // Include cells that have output data (e.g. "CAIT DEPOSIT/BUY/SELL"
-                // memos), because the default filter only matches data-free cells.
-                const cellFilter = { outputDataLenRange: [0, 0xffffffff] as [number, number] };
-                await tx.completeInputsByCapacity(tradingSigner, undefined, cellFilter);
-                await tx.completeFeeBy(tradingSigner, 1000, cellFilter);
-                const refundTxHash = await tradingSigner.sendTransaction(tx);
-
-                console.log(
-                    `[recapitalize] Refunded ${refundCKB.toFixed(4)} CKB → ${body.wallet_address} | tx: ${refundTxHash}`
-                );
-
-                return NextResponse.json({
-                    action: "refund_done",
-                    refunded_amount: refundCKB,
-                    on_chain_balance: onChainBalance,
-                    refund_tx_hash: refundTxHash,
-                    refund_explorer_link: `${EXPLORER_BASE}/${refundTxHash}`,
-                });
-            } catch (err: unknown) {
-                const msg = err instanceof Error ? err.message : String(err);
-                return NextResponse.json(
-                    { error: `Refund transaction failed: ${msg}` },
-                    { status: 500 }
-                );
-            }
-        }
-    }
-
-    // ── Case 3: Delta within MIN_TRANSFER — nothing to do ────────────────────
-    return NextResponse.json({
-        action: "none",
-        on_chain_balance: onChainBalance,
-    });
-}
-
-function stringToHex(str: string): string {
-    const bytes = new TextEncoder().encode(str);
-    return "0x" + Array.from(bytes)
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
+    return NextResponse.json({ action: "deposit", amount: body.new_capital });
 }

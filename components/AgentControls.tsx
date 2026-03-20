@@ -69,24 +69,35 @@ export default function AgentControls() {
                 }),
             ]);
 
+            // Fetch on-chain balance inline so we can pre-fill the capital field
+            // with the actual current balance (not the stale DB value).
+            let onChainBalance: number | null = null;
+            if (walletRes.ok) {
+                const { trading_address } = await walletRes.json();
+                setTradingWallet(trading_address);
+                if (trading_address?.address) {
+                    const balRes = await fetch(
+                        `/api/settings/trading-balance?address=${encodeURIComponent(trading_address.address)}`
+                    );
+                    if (balRes.ok) {
+                        const { balance_ckb } = await balRes.json();
+                        onChainBalance = balance_ckb;
+                        setTradingBalance(balance_ckb);
+                    }
+                }
+            }
+
             if (settingsRes.data) {
                 const d = settingsRes.data;
                 setForm({
                     likelyBuyPrice: String(d.likely_buy_price),
                     likelySellPrice: String(d.likely_sell_price),
-                    totalCapital: String(d.total_capital),
+                    // Default to "0": this field is how much to ADD, not the total.
+                    // The current balance is shown in the trading wallet panel above.
+                    totalCapital: "0",
                     maxPerTrade: String(d.max_per_trade),
                 });
                 setIsRunning(d.is_running);
-            }
-
-            if (walletRes.ok) {
-                const { trading_address } = await walletRes.json();
-                setTradingWallet(trading_address);
-                // Fetch on-chain balance for the trading wallet
-                if (trading_address?.address) {
-                    fetchBalance(trading_address.address);
-                }
             }
 
             setLoading(false);
@@ -122,15 +133,21 @@ export default function AgentControls() {
     function validate(): string | null {
         const buy     = parseFloat(form.likelyBuyPrice);
         const sell    = parseFloat(form.likelySellPrice);
-        const capital = parseFloat(form.totalCapital);
+        const deposit = parseFloat(form.totalCapital);   // amount to ADD this session
         const max     = parseFloat(form.maxPerTrade);
 
-        if (!buy || !sell || !capital || !max) return "All fields are required.";
-        if (buy <= 0 || sell <= 0 || capital <= 0 || max <= 0)
+        if (!buy || !sell || isNaN(deposit) || form.totalCapital === "" || !max)
+            return "All fields are required.";
+        if (buy <= 0 || sell <= 0 || max <= 0)
             return "All values must be greater than 0.";
-        if (sell <= buy)   return "Sell price must be greater than buy price.";
-        if (max > capital) return "Max per trade cannot exceed total capital.";
-        if (capital < 61)  return "Total capital must be at least 61 CKB.";
+        if (sell <= buy) return "Sell price must be greater than buy price.";
+        if (deposit < 0) return "Deposit amount cannot be negative.";
+        if (deposit > 0 && deposit < 60)
+            return "Minimum deposit is 60 CKB. Enter 0 to update settings without depositing.";
+        // Validate max-per-trade against total capital after this deposit
+        const totalAfterDeposit = (tradingBalance ?? 0) + deposit;
+        if (totalAfterDeposit > 0 && max > totalAfterDeposit)
+            return "Max per trade cannot exceed total capital.";
         return null;
     }
 
@@ -155,33 +172,36 @@ export default function AgentControls() {
 
         setStatus("saving");
         setErrorMsg("");
-        const newCapital = parseFloat(form.totalCapital);
+        const depositAmount = parseFloat(form.totalCapital) || 0; // amount to ADD
 
-        // ── Step 1: Ask server to compute the delta and handle any refund ────────
+        // ── Step 1: Validate deposit server-side (balance check) ─────────────────
         setSavingMsg(STEP_ADJUST);
-        let adjustAction: "deposit" | "refund_done" | "none";
-        let depositAmount = 0;
-        try {
-            const res = await fetch("/api/settings/recapitalize", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ wallet_address: address, new_capital: newCapital }),
-            });
-            const json = await res.json();
-            if (!res.ok) {
-                setErrorMsg(json.error ?? "Capital adjustment failed.");
+        let adjustAction: "deposit" | "none";
+        if (depositAmount === 0) {
+            // No deposit requested — skip the server round-trip entirely
+            adjustAction = "none";
+        } else {
+            try {
+                const res = await fetch("/api/settings/recapitalize", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ wallet_address: address, new_capital: depositAmount }),
+                });
+                const json = await res.json();
+                if (!res.ok) {
+                    setErrorMsg(json.error ?? "Capital adjustment failed.");
+                    setStatus("error");
+                    return;
+                }
+                adjustAction = json.action; // "deposit" | "none"
+            } catch {
+                setErrorMsg("Failed to contact server. Check your connection.");
                 setStatus("error");
                 return;
             }
-            adjustAction  = json.action;          // "deposit" | "refund_done" | "none"
-            depositAmount = json.amount ?? 0;     // only set when action === "deposit"
-        } catch {
-            setErrorMsg("Failed to contact server. Check your connection.");
-            setStatus("error");
-            return;
         }
 
-        // ── Step 2: Deposit the difference only if the server says so ────────────
+        // ── Step 2: Deposit the requested amount if the server approved it ────────
         if (adjustAction === "deposit") {
             setSavingMsg(STEP_DEPOSIT);
             try {
@@ -196,8 +216,11 @@ export default function AgentControls() {
                     outputsData: [stringToHex(`CAIT DEPOSIT ${depositAmount.toFixed(2)} CKB`)],
                 });
 
-                await tx.completeInputsByCapacity(signer);
-                await tx.completeFeeBy(signer, 1000);
+                // Include cells that carry data (e.g. "CAIT REFUND" memos that
+                // landed in the user's wallet), so they can fund this deposit.
+                const cellFilter = { outputDataLenRange: [0, 0xffffffff] as [number, number] };
+                await tx.completeInputsByCapacity(signer, undefined, cellFilter);
+                await tx.completeFeeBy(signer, 1000, cellFilter);
                 await signer.sendTransaction(tx);
             } catch (e: unknown) {
                 const msg = e instanceof Error ? e.message : String(e);
@@ -209,11 +232,13 @@ export default function AgentControls() {
 
         // ── Step 3: Upsert settings ───────────────────────────────────────────────
         setSavingMsg(STEP_SAVE);
+        // total_capital = current on-chain balance + newly deposited amount
+        const newTotalCapital = (tradingBalance ?? 0) + depositAmount;
         const payload: AgentSettings & Record<string, unknown> = {
             wallet_address: address,
             likely_buy_price: parseFloat(form.likelyBuyPrice),
             likely_sell_price: parseFloat(form.likelySellPrice),
-            total_capital: newCapital,
+            total_capital: newTotalCapital,
             max_per_trade: parseFloat(form.maxPerTrade),
             is_running: false,
             trading_address: tradingWallet,
@@ -412,13 +437,29 @@ export default function AgentControls() {
                         />
                     </div>
                     <div className="space-y-1.5">
-                        <Label className="text-xs text-white/50">Total Trading Capital (CKB)</Label>
+                        <Label className="text-xs text-white/50">Deposit Capital (CKB)</Label>
                         <Input
-                            placeholder="e.g. 10000"
+                            placeholder="0"
                             value={form.totalCapital}
                             onChange={(e) => handleChange("totalCapital", e.target.value)}
                             className="bg-white/5 border-white/10 text-white placeholder:text-white/20 focus:border-cyan-500"
                         />
+                        {(() => {
+                            const amt = parseFloat(form.totalCapital);
+                            if (amt > 0 && tradingBalance !== null) {
+                                const newTotal = tradingBalance + amt;
+                                return (
+                                    <p className="text-[10px] text-cyan-300/70 leading-tight">
+                                        {tradingBalance.toFixed(2)} + {amt.toFixed(2)} = <span className="font-semibold">{newTotal.toFixed(2)} CKB</span> total — your wallet will be debited {amt.toFixed(2)} CKB.
+                                    </p>
+                                );
+                            }
+                            return (
+                                <p className="text-[10px] text-white/25 leading-tight">
+                                    Amount to add to your trading wallet. Enter 0 to update settings only. Min 60 CKB per deposit.
+                                </p>
+                            );
+                        })()}
                     </div>
                     <div className="space-y-1.5">
                         <Label className="text-xs text-white/50">Max Amount Per Trade (CKB)</Label>
@@ -449,7 +490,7 @@ export default function AgentControls() {
                 {status === "saved" && (
                     <div className="flex items-center gap-2 text-emerald-400 text-xs bg-emerald-400/10 border border-emerald-400/20 rounded-lg px-3 py-2">
                         <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                        Capital deposited &amp; settings saved. Toggle the switch to start trading.
+                        Settings saved. Toggle the switch to start trading.
                     </div>
                 )}
 

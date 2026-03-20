@@ -131,18 +131,17 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
         return;
     }
 
-    // Remaining = on-chain total minus what is conceptually "in trade"
+    // ── Sync in-memory remaining capital ─────────────────────────────────────
+    // On the first tick after startup (or if the DB total_capital is 0), seed it
+    // from the on-chain balance.  After that, total_capital is owned by the
+    // simulation and is only updated when a trade closes — NOT overwritten from
+    // the on-chain balance (which never changes due to wins/losses).
+    const simulationCapital = settings.total_capital > 0
+        ? settings.total_capital
+        : onChainBalance;
+
     const capitalInTrade = settings.capital_in_trading ?? 0;
-    const remainingCapital = Math.max(0, onChainBalance - capitalInTrade);
-
-    // Sync in-memory state and DB with actual on-chain balance
-    agentState.remainingCapital = remainingCapital;
-
-    // Keep DB total_capital in sync with on-chain reality
-    await db
-        .from("agent_settings")
-        .update({ total_capital: onChainBalance, updated_at: new Date().toISOString() })
-        .eq("wallet_address", addr);
+    agentState.remainingCapital = Math.max(0, simulationCapital - capitalInTrade);
 
     // Check ±25% windows
     const inBuyWindow =
@@ -237,31 +236,18 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
     }
 
     // ── P&L calculation (only on sell) ───────────────────────────────────────
+    // Formula: the position was opened with `lastBuyAmount` CKB at `lastBuyPrice`.
+    // The USD value of that position has changed by lastBuyAmount × ΔPrice.
+    // We convert that back to CKB at the current price to get the CKB-equivalent
+    // gain or loss.  pnl_ckb is positive on a win, negative on a loss.
     let pnl_usd: number | null = null;
     let pnl_ckb: number | null = null;
-    let profit_tx_hash: string | undefined;
 
     if (isSell && agentState.lastBuyPrice !== null && agentState.lastBuyAmount !== null) {
         pnl_usd = agentState.lastBuyAmount * (currentPrice - agentState.lastBuyPrice);
         pnl_ckb = pnl_usd / currentPrice;
         const sign = pnl_usd >= 0 ? "+" : "";
         console.log(`📈  P&L: ${sign}${pnl_usd.toFixed(4)} USD  (${sign}${pnl_ckb.toFixed(2)} CKB)`);
-
-        // Send profit to user's main wallet from the trading wallet
-        if (pnl_ckb > 61) {
-            const profitMemo = `CAIT PROFIT ${pnl_ckb.toFixed(2)} CKB | P&L $${pnl_usd.toFixed(4)}`;
-            try {
-                const profitResult = await sendCKBWithMemo(userSigner, addr, pnl_ckb, profitMemo);
-                profit_tx_hash = profitResult.txHash;
-                console.log(`💸  Profit sent to owner: ${profitResult.txHash}`);
-            } catch (err) {
-                console.error("❌  Profit payout TX failed:", err);
-            }
-        } else if (pnl_ckb > 0) {
-            console.log(`ℹ️   Profit ${pnl_ckb.toFixed(2)} CKB below 61 CKB minimum — skipping payout.`);
-        } else {
-            console.log(`📉  Loss trade — no profit payout.`);
-        }
     }
 
     // ── Martingale: was this a loss? ──────────────────────────────────────────
@@ -275,7 +261,10 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
         agentState.lastBuyPrice  = currentPrice;
         agentState.lastBuyAmount = amount;
     } else if (isSell) {
-        agentState.remainingCapital += amount;
+        // Return the original stake AND apply the P&L.
+        // pnl_ckb is positive on a win (capital grows) and negative on a loss
+        // (capital shrinks) — this is the core of the simulation accounting.
+        agentState.remainingCapital += amount + (pnl_ckb ?? 0);
         agentState.lastBuyPrice  = null;
         agentState.lastBuyAmount = null;
     }
@@ -297,13 +286,14 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
         explorer_link: explorerLink,
         pnl_ckb,
         pnl_usd,
-        profit_tx_hash,
     });
 
     // ── Persist stats + position to DB ────────────────────────────────────────
+    // total_capital is the simulation capital — set on a sell to reflect P&L.
+    // On a buy it stays unchanged (capital is just redistributed: remaining ↓,
+    // capital_in_trading ↑).  We never overwrite it from on-chain balance.
     const dbUpdate: Record<string, unknown> = {
         updated_at: new Date().toISOString(),
-        total_capital: agentState.remainingCapital,
     };
 
     if (isBuy) {
@@ -313,6 +303,8 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
     }
 
     if (isSell) {
+        // Simulation capital = remaining + what's still in trade (0 after close)
+        dbUpdate.total_capital      = agentState.remainingCapital;
         dbUpdate.capital_in_trading = 0;
         dbUpdate.last_buy_price     = null;
         dbUpdate.last_buy_amount    = null;
@@ -349,7 +341,6 @@ async function saveTrade(trade: {
     explorer_link?: string;
     pnl_ckb?: number | null;
     pnl_usd?: number | null;
-    profit_tx_hash?: string;
 }) {
     const { error } = await db.from("trades").insert({
         ...trade,

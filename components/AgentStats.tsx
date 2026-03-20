@@ -5,8 +5,19 @@ import { ccc } from "@ckb-ccc/connector-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import {
   Wallet, TrendingUp, TrendingDown, Repeat, BarChart3, Coins,
+  ArrowDownToLine, Loader2, CheckCircle2, AlertCircle,
 } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import type { AgentSettings } from "@/lib/supabase";
@@ -19,6 +30,9 @@ export default function AgentStats() {
   const [onChainBalance, setOnChainBalance] = useState<number | null>(null);
   const [loading, setLoading]             = useState(true);
   const [address, setAddress]             = useState("");
+  const [withdrawOpen, setWithdrawOpen]   = useState(false);
+  const [withdrawStatus, setWithdrawStatus] = useState<"idle" | "pending" | "done" | "error">("idle");
+  const [withdrawMsg, setWithdrawMsg]     = useState("");
 
   useEffect(() => {
     if (!signer) { setLoading(false); return; }
@@ -60,6 +74,45 @@ export default function AgentStats() {
         </CardContent>
       </Card>
     );
+  }
+
+  async function handleWithdraw() {
+    if (!address) return;
+    setWithdrawStatus("pending");
+    setWithdrawMsg("");
+    try {
+      const res = await fetch("/api/settings/withdraw", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ wallet_address: address }),
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        setWithdrawStatus("error");
+        setWithdrawMsg(json.error ?? "Withdrawal failed.");
+      } else {
+        setWithdrawStatus("done");
+        setWithdrawMsg(json.tx_hash
+          ? `Funds sent. Tx: ${json.tx_hash.slice(0, 18)}…`
+          : json.message ?? "Withdrawal complete."
+        );
+        // Refresh local state
+        setSettings((prev) => prev ? { ...prev, is_running: false, total_capital: 0, capital_in_trading: 0 } : prev);
+        setOnChainBalance(null);
+      }
+    } catch {
+      setWithdrawStatus("error");
+      setWithdrawMsg("Network error. Please try again.");
+    }
+  }
+
+  function handleWithdrawOpenChange(open: boolean) {
+    setWithdrawOpen(open);
+    if (!open) {
+      // Reset state when dialog closes
+      setWithdrawStatus("idle");
+      setWithdrawMsg("");
+    }
   }
 
   // ── Derived stats ───────────────────────────────────────────────────────────
@@ -162,6 +215,80 @@ export default function AgentStats() {
               color={pnlPositive ? "text-emerald-400" : "text-red-400"}
             />
 
+          </div>
+        )}
+
+        {/* ── Withdraw button ── */}
+        {settings && (
+          <div className="pt-2 border-t border-white/10">
+            <Dialog open={withdrawOpen} onOpenChange={handleWithdrawOpenChange}>
+              <DialogTrigger asChild>
+                <Button
+                  variant="outline"
+                  className="w-full border-orange-500/30 text-orange-400 hover:bg-orange-500/10 hover:text-orange-300 hover:border-orange-400/50 gap-2 text-xs"
+                >
+                  <ArrowDownToLine className="w-3.5 h-3.5" />
+                  Withdraw All Funds
+                </Button>
+              </DialogTrigger>
+              <DialogContent className="bg-zinc-900 border-white/10 text-white max-w-sm">
+                <DialogHeader>
+                  <DialogTitle className="text-white flex items-center gap-2">
+                    <ArrowDownToLine className="w-4 h-4 text-orange-400" />
+                    Withdraw All Funds
+                  </DialogTitle>
+                  <DialogDescription className="text-white/50 text-sm leading-relaxed">
+                    This will transfer all capital from your trading wallet back to your owner
+                    address. If the agent is currently running, it will be stopped automatically.
+                  </DialogDescription>
+                </DialogHeader>
+
+                {withdrawStatus === "error" && (
+                  <div className="flex items-center gap-2 text-red-400 text-xs bg-red-400/10 border border-red-400/20 rounded-lg px-3 py-2">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                    {withdrawMsg}
+                  </div>
+                )}
+                {withdrawStatus === "done" && (
+                  <div className="flex items-center gap-2 text-emerald-400 text-xs bg-emerald-400/10 border border-emerald-400/20 rounded-lg px-3 py-2">
+                    <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                    {withdrawMsg}
+                  </div>
+                )}
+
+                <DialogFooter className="gap-2 sm:gap-2">
+                  {withdrawStatus !== "done" && (
+                    <Button
+                      variant="outline"
+                      onClick={() => handleWithdrawOpenChange(false)}
+                      disabled={withdrawStatus === "pending"}
+                      className="border-white/10 text-white/60 hover:text-white hover:bg-white/5"
+                    >
+                      Cancel
+                    </Button>
+                  )}
+                  {withdrawStatus === "done" ? (
+                    <Button
+                      onClick={() => handleWithdrawOpenChange(false)}
+                      className="bg-emerald-600 hover:bg-emerald-500 text-white"
+                    >
+                      Done
+                    </Button>
+                  ) : (
+                    <Button
+                      onClick={handleWithdraw}
+                      disabled={withdrawStatus === "pending"}
+                      className="bg-orange-600 hover:bg-orange-500 text-white gap-2"
+                    >
+                      {withdrawStatus === "pending" && (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      )}
+                      {withdrawStatus === "pending" ? "Processing…" : "Confirm Withdrawal"}
+                    </Button>
+                  )}
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
           </div>
         )}
       </CardContent>
