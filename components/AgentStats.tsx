@@ -6,6 +6,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import {
   Dialog,
   DialogContent,
@@ -26,13 +27,15 @@ const POLL_INTERVAL = 10_000;
 
 export default function AgentStats() {
   const signer = ccc.useSigner();
-  const [settings, setSettings]           = useState<AgentSettings | null>(null);
-  const [onChainBalance, setOnChainBalance] = useState<number | null>(null);
-  const [loading, setLoading]             = useState(true);
-  const [address, setAddress]             = useState("");
-  const [withdrawOpen, setWithdrawOpen]   = useState(false);
+  const [settings, setSettings]             = useState<AgentSettings | null>(null);
+  const [onChainBalance, setOnChainBalance]  = useState<number | null>(null);
+  const [loading, setLoading]               = useState(true);
+  const [address, setAddress]               = useState("");
+  const [isRunning, setIsRunning]           = useState(false);
+  const [togglePending, setTogglePending]   = useState(false);
+  const [withdrawOpen, setWithdrawOpen]     = useState(false);
   const [withdrawStatus, setWithdrawStatus] = useState<"idle" | "pending" | "done" | "error">("idle");
-  const [withdrawMsg, setWithdrawMsg]     = useState("");
+  const [withdrawMsg, setWithdrawMsg]       = useState("");
 
   useEffect(() => {
     if (!signer) { setLoading(false); return; }
@@ -46,9 +49,10 @@ export default function AgentStats() {
       .eq("wallet_address", addr)
       .maybeSingle();
     if (data) {
-      setSettings(data as AgentSettings);
-      // Fetch on-chain balance from the trading wallet
-      const tradingAddr = (data as AgentSettings).trading_address?.address;
+      const s = data as AgentSettings;
+      setSettings(s);
+      setIsRunning(s.is_running);
+      const tradingAddr = s.trading_address?.address;
       if (tradingAddr) {
         fetch(`/api/settings/trading-balance?address=${encodeURIComponent(tradingAddr)}`)
           .then((r) => r.json())
@@ -66,16 +70,34 @@ export default function AgentStats() {
     return () => clearInterval(id);
   }, [address]);
 
-  if (!signer) {
-    return (
-      <Card className="bg-white/5 border-white/10 text-white">
-        <CardContent className="py-5">
-          <p className="text-sm text-white/30 text-center">Connect wallet to view agent stats.</p>
-        </CardContent>
-      </Card>
-    );
+  // ── Toggle handler — uses the server API (service role) to bypass RLS ────
+  async function handleToggle(checked: boolean) {
+    if (!address || togglePending) return;
+    setTogglePending(true);
+    setIsRunning(checked); // optimistic
+    try {
+      const res = await fetch(
+        `/api/settings?wallet=${encodeURIComponent(address)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ is_running: checked }),
+        }
+      );
+      if (!res.ok) {
+        // Rollback on failure
+        setIsRunning(!checked);
+      } else {
+        setSettings((prev) => prev ? { ...prev, is_running: checked } : prev);
+      }
+    } catch {
+      setIsRunning(!checked);
+    } finally {
+      setTogglePending(false);
+    }
   }
 
+  // ── Withdraw handlers ─────────────────────────────────────────────────────
   async function handleWithdraw() {
     if (!address) return;
     setWithdrawStatus("pending");
@@ -92,12 +114,13 @@ export default function AgentStats() {
         setWithdrawMsg(json.error ?? "Withdrawal failed.");
       } else {
         setWithdrawStatus("done");
-        setWithdrawMsg(json.tx_hash
-          ? `Funds sent. Tx: ${json.tx_hash.slice(0, 18)}…`
-          : json.message ?? "Withdrawal complete."
+        setWithdrawMsg(
+          json.tx_hash
+            ? `Funds sent. Tx: ${json.tx_hash.slice(0, 18)}…`
+            : json.message ?? "Withdrawal complete."
         );
-        // Refresh local state
         setSettings((prev) => prev ? { ...prev, is_running: false, total_capital: 0, capital_in_trading: 0 } : prev);
+        setIsRunning(false);
         setOnChainBalance(null);
       }
     } catch {
@@ -109,31 +132,89 @@ export default function AgentStats() {
   function handleWithdrawOpenChange(open: boolean) {
     setWithdrawOpen(open);
     if (!open) {
-      // Reset state when dialog closes
       setWithdrawStatus("idle");
       setWithdrawMsg("");
     }
   }
 
-  // ── Derived stats ───────────────────────────────────────────────────────────
-  const totalTrades  = (settings?.win_count ?? 0) + (settings?.loss_count ?? 0);
-  const winRate      = totalTrades > 0 ? ((settings?.win_count ?? 0) / totalTrades) * 100 : null;
-  const lossRate     = totalTrades > 0 ? ((settings?.loss_count ?? 0) / totalTrades) * 100 : null;
-  const pnlPositive  = (settings?.total_pnl_ckb ?? 0) >= 0;
+  // ── Validation for the toggle ─────────────────────────────────────────────
+  // Agent can only run if: trading wallet has funds AND max_per_trade < total_capital
+  const hasBalance    = (onChainBalance ?? 0) > 0;
+  const maxBelowTotal = settings
+    ? settings.max_per_trade < settings.total_capital
+    : false;
+  const canRun = !!settings && hasBalance && maxBelowTotal;
+
+  const disabledReason = !settings
+    ? "Save your settings first."
+    : !hasBalance
+    ? "Deposit funds into your trading wallet first."
+    : !maxBelowTotal
+    ? "Max per trade must be less than total capital."
+    : null;
+
+  // ── Derived stats ─────────────────────────────────────────────────────────
+  const totalTrades = (settings?.win_count ?? 0) + (settings?.loss_count ?? 0);
+  const winRate     = totalTrades > 0 ? ((settings?.win_count ?? 0) / totalTrades) * 100 : null;
+  const lossRate    = totalTrades > 0 ? ((settings?.loss_count ?? 0) / totalTrades) * 100 : null;
+  const pnlPositive = (settings?.total_pnl_ckb ?? 0) >= 0;
+
+  if (!signer) {
+    return (
+      <Card className="bg-white/5 border-white/10 text-white">
+        <CardContent className="py-5">
+          <p className="text-sm text-white/30 text-center">Connect wallet to view agent stats.</p>
+        </CardContent>
+      </Card>
+    );
+  }
 
   return (
     <Card className="bg-white/5 border-white/10 text-white">
-      <CardHeader className="flex flex-row items-center justify-between pb-3">
-        <CardTitle className="text-sm text-white/80 flex items-center gap-2">
-          <BarChart3 className="w-4 h-4 text-cyan-400" />
-          Agent Stats
-        </CardTitle>
-        <Badge
-          variant="outline"
-          className="text-[10px] border-white/20 text-white/30"
-        >
-          Live · 10s
-        </Badge>
+      <CardHeader className="pb-3">
+        {/* Title row */}
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-sm text-white/80 flex items-center gap-2">
+            <BarChart3 className="w-4 h-4 text-cyan-400" />
+            Agent Stats
+          </CardTitle>
+          <Badge variant="outline" className="text-[10px] border-white/20 text-white/30">
+            Live · 10s
+          </Badge>
+        </div>
+
+        {/* Toggle row — only shown once settings are loaded */}
+        {!loading && (
+          <div className="flex items-center justify-between pt-2 mt-1 border-t border-white/10">
+            <div className="flex flex-col gap-0.5">
+              <span className="text-xs text-white/60">
+                {isRunning ? "Agent is running" : "Agent is stopped"}
+              </span>
+              {!isRunning && disabledReason && (
+                <span className="text-[10px] text-white/30 leading-tight">{disabledReason}</span>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              {togglePending && <Loader2 className="w-3 h-3 animate-spin text-white/30" />}
+              <Switch
+                checked={isRunning}
+                onCheckedChange={handleToggle}
+                disabled={togglePending || (!isRunning && !canRun)}
+                className="data-[state=checked]:bg-cyan-500"
+              />
+              <Badge
+                variant="outline"
+                className={
+                  isRunning
+                    ? "border-emerald-400/40 text-emerald-400 text-[10px]"
+                    : "border-white/20 text-white/30 text-[10px]"
+                }
+              >
+                {isRunning ? "LIVE" : "OFF"}
+              </Badge>
+            </div>
+          </div>
+        )}
       </CardHeader>
 
       <CardContent className="pt-0">
@@ -150,7 +231,6 @@ export default function AgentStats() {
         ) : (
           <div className="grid grid-cols-2 gap-3">
 
-            {/* Total capital — DB value (synced from on-chain by the agent) */}
             <StatTile
               icon={<Wallet className="w-3.5 h-3.5 text-cyan-400" />}
               label="Total Capital"
@@ -162,7 +242,6 @@ export default function AgentStats() {
               color="text-cyan-300"
             />
 
-            {/* Capital in trading */}
             <StatTile
               icon={<Coins className="w-3.5 h-3.5 text-purple-400" />}
               label="Capital in Trade"
@@ -175,7 +254,6 @@ export default function AgentStats() {
               color="text-purple-300"
             />
 
-            {/* Win rate */}
             <StatTile
               icon={<TrendingUp className="w-3.5 h-3.5 text-emerald-400" />}
               label="Win Rate"
@@ -184,7 +262,6 @@ export default function AgentStats() {
               color="text-emerald-400"
             />
 
-            {/* Loss rate */}
             <StatTile
               icon={<TrendingDown className="w-3.5 h-3.5 text-red-400" />}
               label="Loss Rate"
@@ -193,7 +270,6 @@ export default function AgentStats() {
               color="text-red-400"
             />
 
-            {/* Martingale count */}
             <StatTile
               icon={<Repeat className="w-3.5 h-3.5 text-orange-400" />}
               label="Martingale Used"
@@ -202,7 +278,6 @@ export default function AgentStats() {
               color="text-orange-400"
             />
 
-            {/* Total P&L */}
             <StatTile
               icon={
                 pnlPositive
@@ -220,7 +295,7 @@ export default function AgentStats() {
 
         {/* ── Withdraw button ── */}
         {settings && (
-          <div className="pt-2 border-t border-white/10">
+          <div className="mt-3 pt-3 border-t border-white/10">
             <Dialog open={withdrawOpen} onOpenChange={handleWithdrawOpenChange}>
               <DialogTrigger asChild>
                 <Button

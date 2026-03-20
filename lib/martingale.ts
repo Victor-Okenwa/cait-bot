@@ -3,26 +3,21 @@ export type MartingaleState = {
     consecutiveLosses: number;
 };
 
-/**                                                                          
- * Calculate the trade size for the current cycle.                           
- *                                                                           
- * Rules:                                                                    
- * - Normal trade: half of maxPerTrade                                       
- * - After a loss: double the previous size (Martingale)                     
- * - Never exceed maxPerTrade
- * - Never exceed remainingCapital                                           
+/**
+ * Calculate the trade size for the current cycle.
+ *
+ * Rules:
+ * - Normal trade: half of maxPerTrade (conservative sizing)
+ * - After a loss (Martingale): full maxPerTrade (step up to recover)
+ * - Never exceed remainingCapital
  */
 export function calculateTradeSize(
     maxPerTrade: number,
     remainingCapital: number,
     state: MartingaleState
 ): { amount: number; isMartingale: boolean } {
-    const base = maxPerTrade / 2;
-    const multiplier = Math.pow(2, state.consecutiveLosses);
-    const desired = state.lastTradeWasLoss ? base * multiplier : base;
-
-    const capped = Math.min(desired, maxPerTrade);
-    const amount = Math.min(capped, remainingCapital);
+    const desired = state.lastTradeWasLoss ? maxPerTrade : maxPerTrade / 2;
+    const amount = Math.min(desired, remainingCapital);
 
     return {
         amount,

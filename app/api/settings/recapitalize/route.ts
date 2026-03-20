@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getAddressBalanceCKB } from "@/lib/balance";
 
-const MIN_DEPOSIT_CKB = 60;
+const MIN_DEPOSIT_CKB = 800;
 
 /**
  * POST /api/settings/recapitalize
@@ -39,13 +39,13 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ action: "none" });
     }
 
-    // Below minimum cell size
+    // Below minimum deposit
     if (body.new_capital < MIN_DEPOSIT_CKB) {
         return NextResponse.json(
             {
                 error:
-                    `Deposit amount must be at least ${MIN_DEPOSIT_CKB} CKB. ` +
-                    `Enter 0 to update settings without depositing.`,
+                    `Minimum deposit is ${MIN_DEPOSIT_CKB} CKB. ` +
+                    `Enter 0 to update settings without depositing (requires existing balance > 799 CKB).`,
             },
             { status: 400 }
         );
