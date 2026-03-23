@@ -7,6 +7,7 @@ import {
   AreaChart, Area,
   XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer,
+  BarShapeProps,
 } from "recharts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -16,6 +17,7 @@ import {
   CandlestickChart, LineChart as LineIcon, AreaChart as AreaIcon,
   Maximize2, Minimize2, RefreshCw,
 } from "lucide-react";
+import { ActiveShape } from "recharts/types/util/types";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -85,7 +87,7 @@ function safeMax(arr: number[]) { return arr.reduce((a, b) => Math.max(a, b), -I
 // relying on the unreliable yAxis.scale reference.
 
 function makeCandlestickShape(minPrice: number, maxPrice: number) {
-  return function CandlestickShape(props: any) {
+  return function CandlestickShape(props: { x: number; width: number; background: { y: number; height: number }; open: number; high: number; low: number; close: number }) {
     const { x, width, background, open, high, low, close } = props;
     if (!background?.height) return null;
     if (open == null || high == null || low == null || close == null) return null;
@@ -127,7 +129,7 @@ function makeCandlestickShape(minPrice: number, maxPrice: number) {
 
 // ─── Candle tooltip ───────────────────────────────────────────────────────────
 
-function CandleTooltip({ active, payload, label, prec }: any) {
+function CandleTooltip({ active, payload, label, prec }: { active: boolean; payload: { payload: CandlePoint }[]; label: string; prec: number }) {
   if (!active || !payload?.length) return null;
   const d = payload[0]?.payload as CandlePoint;
   if (!d?.open) return null;
@@ -161,8 +163,8 @@ async function fetchWithRetry(url: string, maxAttempts = 3, baseDelayMs = 1500):
         }
       }
       return res;
-    } catch (e: any) {
-      lastError = e;
+    } catch (e: unknown) {
+      lastError = e as Error;
       if (attempt < maxAttempts - 1)
         await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, attempt)));
     }
@@ -253,8 +255,8 @@ export default function PriceChart() {
         setCurrentPrice(prices[prices.length - 1][1]);
         setChartData(prices.map(([ts, price]) => ({ time: fmtTime(ts, cfg.chartDays), price })));
       }
-    } catch (e: any) {
-      setError(e.message ?? "Fetch failed");
+    } catch (e: unknown) {
+      setError((e as Error).message ?? "Fetch failed");
     } finally {
       setLoading(false);
       setRefetching(false);
@@ -371,7 +373,7 @@ export default function PriceChart() {
       return wrap(
         <LineChart {...shared}>
           {grid}{xAxis}{yAxis}
-          <Tooltip {...tooltipStyle} formatter={(v: number) => [`$${v.toFixed(prec)}`, "CKB"]} />
+          <Tooltip {...tooltipStyle} formatter={(v) => [`$${Number(v).toFixed(prec)}`, "CKB"]} />
           <Line
             type="monotone" dataKey="price" stroke="#22d3ee"
             strokeWidth={1.5} dot={false} activeDot={{ r: 3, fill: "#22d3ee" }}
@@ -390,7 +392,7 @@ export default function PriceChart() {
             </linearGradient>
           </defs>
           {grid}{xAxis}{yAxis}
-          <Tooltip {...tooltipStyle} formatter={(v: number) => [`$${v.toFixed(prec)}`, "CKB"]} />
+          <Tooltip {...tooltipStyle} formatter={(v) => [`$${Number(v).toFixed(prec)}`, "CKB"]} />
           <Area
             type="monotone" dataKey="price" stroke="#22d3ee"
             strokeWidth={1.5} fill="url(#ckbGrad)" dot={false}
@@ -413,10 +415,10 @@ export default function PriceChart() {
           tickFormatter={(v) => `$${v.toFixed(prec)}`}
           width={78}
         />
-        <Tooltip content={<CandleTooltip prec={prec} />} cursor={{ fill: "rgba(255,255,255,0.04)" }} />
+        <Tooltip content={<CandleTooltip prec={prec} active={false} payload={[]} label={""} />} cursor={{ fill: "rgba(255,255,255,0.04)" }} />
         <Bar
           dataKey="high"
-          shape={candleShape}
+          shape={candleShape as ActiveShape<BarShapeProps, SVGPathElement>}
           isAnimationActive={false}
           fill="transparent"
           stroke="transparent"

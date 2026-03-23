@@ -1,4 +1,5 @@
 "use client";
+/* eslint-disable @typescript-eslint/no-unused-expressions */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ccc } from "@ckb-ccc/connector-react";
