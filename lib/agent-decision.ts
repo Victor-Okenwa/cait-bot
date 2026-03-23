@@ -1,8 +1,8 @@
-import Anthropic from "@anthropic-ai/sdk";
+import Groq from "groq-sdk";
 import type { AgentContext, AgentDecisionResult, TradeDecision } from "@/agent/types";
 
-const client = new Anthropic({
-    apiKey: process.env.ANTHROPIC_API_KEY!,
+const client = new Groq({
+    apiKey: process.env.GROQ_API_KEY!,
 });
 
 const STOP_LOSS_PCT = 5; // realise the loss if price falls ≥5% below buy price
@@ -70,14 +70,14 @@ ${positionBlock}
   - Never open a new buy position while another is already open
   - Be concise and decisive`;
 
-    const message = await client.messages.create({
-        model: "claude-opus-4-6",
+    const completion = await client.chat.completions.create({
+        model: "llama-3.3-70b-versatile",
         max_tokens: 256,
+        response_format: { type: "json_object" },
         messages: [{ role: "user", content: prompt }],
     });
 
-    const raw =
-        message.content[0].type === "text" ? message.content[0].text.trim() : "";
+    const raw = completion.choices[0]?.message?.content?.trim() ?? "";
 
     try {
         const parsed = JSON.parse(raw) as {
@@ -92,7 +92,7 @@ ${positionBlock}
             confidence: Math.min(100, Math.max(0, parsed.confidence ?? 50)),
         };
     } catch {
-        // Fallback if Claude returns malformed JSON                                                                               
+        // Fallback if the model returns malformed JSON
         return {
             decision: "wait",
             reason: "Could not parse AI response — defaulting to wait",

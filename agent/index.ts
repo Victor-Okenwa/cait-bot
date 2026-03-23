@@ -4,7 +4,7 @@
  *
  * Requires env vars (add to .env.local):
  *   SUPABASE_SERVICE_ROLE_KEY=...   (for DB writes)
- *   ANTHROPIC_API_KEY=...           (for Claude decisions)
+ *   GROQ_API_KEY=...                (for Groq/Llama trading decisions)
  *
  * Each user's trades are signed by their own dedicated trading wallet
  * (stored in agent_settings.trading_address). No shared agent key needed.
@@ -156,9 +156,9 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
 
     agentState.remainingCapital = Math.max(0, simulationCapital - agentState.capitalInTrading);
 
-    // ── Position-aware early exit (before any Claude call) ───────────────────
+    // ── Position-aware early exit (before any AI call) ────────────────────────
     // Whether a price window is "relevant" depends entirely on whether a position
-    // is currently open.  This is checked HERE — not after Claude speaks — so the
+    // is currently open.  This is checked HERE — not after the AI speaks — so the
     // agent can never be nudged into a sell it has no position for, or a buy it
     // has no room for.
     const hasPosition =
@@ -192,7 +192,7 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
         }
     }
 
-    // Ask Claude for decision
+    // Ask Groq/Llama for decision
     const recentPrices = getPriceHistory().map((p) => p.price);
     let aiResult;
     try {
@@ -210,7 +210,7 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
             lastBuyAmount: agentState.lastBuyAmount,
         });
     } catch (err) {
-        console.error("❌  Claude call failed:", err);
+        console.error("❌  AI call failed:", err);
         return;
     }
 
@@ -223,7 +223,7 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
 
     // ── Hard stop-loss override ───────────────────────────────────────────────
     // If the AI does not honour the stop-loss rule (e.g. returns "hold" while
-    // deeply in the red), enforce it here regardless of what Claude returned.
+    // deeply in the red), enforce it here regardless of what the AI returned.
     if (belowStopLoss && decision !== "sell_now" && decision !== "sell_early") {
         const dropPct = (
             ((agentState.lastBuyPrice! - currentPrice) / agentState.lastBuyPrice!) * 100
