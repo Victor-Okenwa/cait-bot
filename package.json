@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "agent": "bun run agent/index.ts"
+    "agent": "bun run agent/run.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",

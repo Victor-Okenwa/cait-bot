@@ -10,9 +10,6 @@
  * (stored in agent_settings.trading_address). No shared agent key needed.
  */
 
-import * as dotenv from "dotenv";
-dotenv.config({ path: ".env.local" });
-
 import { ccc } from "@ckb-ccc/core";
 import { createServiceClient } from "@/lib/supabase";
 import { fetchAndRecordPrice, getPriceHistory } from "@/lib/price";
@@ -25,6 +22,7 @@ import {
 } from "@/lib/martingale";
 import { sendCKBWithMemo } from "@/lib/ccc";
 import { getAddressBalanceCKB } from "@/lib/balance";
+import { maybeRefillReserve, sendProfitToUser, collectLossFromUser } from "@/lib/reserve";
 import type { AgentSettings, AgentState, TradeDecision, TradingAddress } from "@/agent/types";
 
 const INTERVAL_MS = 60_000;
@@ -53,19 +51,35 @@ function getOrInitState(settings: AgentSettings): {
             agentState: {
                 walletAddress: key,
                 remainingCapital: settings.total_capital,
+                capitalInTrading: settings.capital_in_trading ?? 0,
                 lastDecision: null,
                 lastTradeWasLoss: false,
                 consecutiveLosses: 0,
                 // ── Restore open position from DB so restarts don't lose context ──
                 lastBuyPrice:  settings.last_buy_price  ?? null,
                 lastBuyAmount: settings.last_buy_amount ?? null,
+                // TX hash is not persisted — will be null after a restart.
+                // The confirmation check is skipped when null (safe: if the
+                // agent restarted, the buy TX very likely confirmed already).
+                lastBuyTxHash: null,
+                pendingPnlCkb: settings.pending_pnl_ckb ?? 0,
             },
         });
 
         if (settings.last_buy_price) {
-            console.log(
-                `♻️   Restored open position: bought ${settings.last_buy_amount?.toFixed(2)} CKB @ $${settings.last_buy_price.toFixed(6)}`
-            );
+            const cap = settings.capital_in_trading ?? 0;
+            if (cap <= 0) {
+                // capital_in_trading is 0 but a position is recorded — the sell guard
+                // will block any sell attempt, preventing a zero-amount sell.
+                console.warn(
+                    `⚠️   Inconsistent DB state: last_buy_price=${settings.last_buy_price.toFixed(6)} ` +
+                    `but capital_in_trading=${cap}. Sell will be blocked until DB is corrected.`
+                );
+            } else {
+                console.log(
+                    `♻️   Restored open position: ${cap.toFixed(2)} CKB bought @ $${settings.last_buy_price.toFixed(6)}`
+                );
+            }
         }
     }
     return stateMap.get(key)!;
@@ -75,6 +89,9 @@ function getOrInitState(settings: AgentSettings): {
 
 async function tick() {
     console.log(`\n⏱  [${new Date().toISOString()}] Agent tick`);
+
+    // Check / refill reserve wallet (no-op if balance is healthy or cooldown active)
+    void maybeRefillReserve();
 
     // Fetch latest price
     let pricePoint;
@@ -140,10 +157,21 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
         ? settings.total_capital
         : onChainBalance;
 
-    const capitalInTrade = settings.capital_in_trading ?? 0;
-    agentState.remainingCapital = Math.max(0, simulationCapital - capitalInTrade);
+    agentState.remainingCapital = Math.max(0, simulationCapital - agentState.capitalInTrading);
 
-    // Check ±25% windows
+    // ── Position-aware early exit (before any Claude call) ───────────────────
+    // Whether a price window is "relevant" depends entirely on whether a position
+    // is currently open.  This is checked HERE — not after Claude speaks — so the
+    // agent can never be nudged into a sell it has no position for, or a buy it
+    // has no room for.
+    const hasPosition =
+        agentState.lastBuyPrice !== null && agentState.capitalInTrading > 0;
+
+    const STOP_LOSS_PCT_EARLY = 5;
+    const belowStopLoss =
+        hasPosition &&
+        currentPrice < agentState.lastBuyPrice! * (1 - STOP_LOSS_PCT_EARLY / 100);
+
     const inBuyWindow =
         currentPrice >= settings.likely_buy_price * 0.75 &&
         currentPrice <= settings.likely_buy_price * 1.25;
@@ -151,17 +179,20 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
         currentPrice >= settings.likely_sell_price * 0.75 &&
         currentPrice <= settings.likely_sell_price * 1.25;
 
-    if (!inBuyWindow && !inSellWindow) {
-        console.log("📊  Price outside both windows — skipping AI call.");
-        await saveTrade({
-            wallet_address: addr,
-            type: "wait",
-            amount: 0,
-            price: currentPrice,
-            reason: "Price outside ±25% buy/sell windows",
-            martingale: false,
-        });
-        return;
+    if (!hasPosition) {
+        // No position held — only buys make sense.  Sell windows are irrelevant.
+        if (!inBuyWindow) {
+            console.log("📊  No position & price outside buy window — waiting.");
+            await saveTrade({ wallet_address: addr, type: "wait", amount: 0, price: currentPrice, reason: "No position — price outside buy window", martingale: false });
+            return;
+        }
+    } else {
+        // Position held — only sells make sense (or stop-loss).  Buy windows are irrelevant.
+        if (!inSellWindow && !belowStopLoss) {
+            console.log("📊  Position open & price outside sell window — holding.");
+            await saveTrade({ wallet_address: addr, type: "hold", amount: 0, price: currentPrice, reason: "Position open — price outside sell window", martingale: false });
+            return;
+        }
     }
 
     // Ask Claude for decision
@@ -178,6 +209,8 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
             lastDecision: agentState.lastDecision,
             consecutiveLosses: agentState.consecutiveLosses,
             recentPrices,
+            lastBuyPrice:  agentState.lastBuyPrice,
+            lastBuyAmount: agentState.lastBuyAmount,
         });
     } catch (err) {
         console.error("❌  Claude call failed:", err);
@@ -188,13 +221,45 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
         `🤖  Decision: ${aiResult.decision} (${aiResult.confidence}%) — ${aiResult.reason}`
     );
 
-    const { decision, reason } = aiResult;
+    let { decision, reason } = aiResult;
     agentState.lastDecision = decision as TradeDecision;
 
+    // ── Hard stop-loss override ───────────────────────────────────────────────
+    // If the AI does not honour the stop-loss rule (e.g. returns "hold" while
+    // deeply in the red), enforce it here regardless of what Claude returned.
+    if (belowStopLoss && decision !== "sell_now" && decision !== "sell_early") {
+        const dropPct = (
+            ((agentState.lastBuyPrice! - currentPrice) / agentState.lastBuyPrice!) * 100
+        ).toFixed(2);
+        console.log(
+            `🛑  Stop-loss triggered: price dropped ${dropPct}% below buy price — forcing sell.`
+        );
+        decision = "sell_now";
+        reason   = `Stop-loss: price fell ${dropPct}% below entry $${agentState.lastBuyPrice!.toFixed(6)}`;
+    }
+
     // Map decision to trade type
-    const isBuy  = decision === "buy_now"  || decision === "buy_early";
-    const isSell = decision === "sell_now" || decision === "sell_early";
+    let isBuy  = decision === "buy_now"  || decision === "buy_early";
+    let isSell = decision === "sell_now" || decision === "sell_early";
     const isPassive = decision === "wait"  || decision === "hold";
+
+    // ── Position guards ───────────────────────────────────────────────────────
+    // Sell without an open position: nothing to sell — demote to hold.
+    // Both lastBuyPrice and capitalInTrading must be set; either being absent
+    // means no real buy was ever committed (guards against stale DB state).
+    if (isSell && (agentState.lastBuyPrice === null || agentState.capitalInTrading <= 0)) {
+        console.log("⚠️   Sell decision ignored — no open position to close.");
+        isSell = false;
+        await saveTrade({ wallet_address: addr, type: "hold", amount: 0, price: currentPrice, reason: "No open position — sell skipped", martingale: false });
+        return;
+    }
+    // Buy while already holding a position: would double-expose — demote to hold.
+    if (isBuy && agentState.lastBuyPrice !== null) {
+        console.log("⚠️   Buy decision ignored — position already open.");
+        isBuy = false;
+        await saveTrade({ wallet_address: addr, type: "hold", amount: 0, price: currentPrice, reason: "Position already open — buy skipped", martingale: false });
+        return;
+    }
 
     if (isPassive) {
         await saveTrade({
@@ -209,15 +274,65 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
     }
 
     // Calculate trade size
-    const { amount, isMartingale } = calculateTradeSize(
+    // For buys: use Martingale sizing (half or full maxPerTrade).
+    // For sells: close the ENTIRE accumulated position — strictly capitalInTrading,
+    //            no fallbacks.  The position guard above already ensures this is > 0.
+    const { amount: buyAmount, isMartingale } = calculateTradeSize(
         settings.max_per_trade,
         agentState.remainingCapital,
         martingale
     );
 
+    const amount = isSell ? agentState.capitalInTrading : buyAmount;
+
     if (amount < 61) {
         console.log("⚠️    Trade amount too small (< 61 CKB minimum). Skipping.");
         return;
+    }
+
+    if (isSell) {
+        console.log(`📦  Closing full position: ${amount.toFixed(2)} CKB (capital_in_trading)`);
+    }
+
+    // ── Guard: for sells, verify the buy TX is confirmed on-chain ─────────────
+    // The CKB node resolves inputs against the confirmed UTXO set only.
+    // If the buy TX is still in the mempool, its change output (used as input
+    // for the sell TX) is "Unknown" to the node → TransactionFailedToResolve.
+    if (isSell && agentState.lastBuyTxHash) {
+        let txStatus: string | undefined;
+        try {
+            const txRecord = await testnetClient.getTransaction(agentState.lastBuyTxHash);
+            txStatus = txRecord?.txStatus?.status;
+        } catch {
+            txStatus = undefined;
+        }
+
+        if (txStatus !== "committed") {
+            if (!txStatus || txStatus === "rejected" || txStatus === "unknown") {
+                // Buy TX was dropped — clear the open position so the agent
+                // doesn't keep trying to sell something that never happened.
+                console.log(
+                    `⚠️   Buy TX ${agentState.lastBuyTxHash.slice(0, 10)}... dropped from mempool. Clearing open position.`
+                );
+                agentState.lastBuyPrice  = null;
+                agentState.lastBuyAmount = null;
+                agentState.lastBuyTxHash = null;
+                await db.from("agent_settings").update({
+                    last_buy_price:     null,
+                    last_buy_amount:    null,
+                    capital_in_trading: 0,
+                }).eq("wallet_address", addr);
+            } else {
+                // Still pending — wait for the next tick.
+                console.log(
+                    `⏳   Buy TX ${agentState.lastBuyTxHash.slice(0, 10)}... still ${txStatus} — skipping sell until confirmed.`
+                );
+            }
+            return;
+        }
+
+        // TX confirmed — no longer need to track the hash.
+        agentState.lastBuyTxHash = null;
     }
 
     // Execute on-chain memo transfer (simulation — self-transfer from trading wallet)
@@ -232,7 +347,16 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
         console.log(`✅  TX sent: ${txHash}`);
     } catch (err) {
         console.error("❌  Transaction failed:", err);
-        // Still log the trade attempt
+        if (isBuy) {
+            // A failed buy TX means no position was opened — do not update state.
+            // If we set lastBuyPrice here and persist it to DB, the agent will think
+            // a position is open and attempt sells on the next tick (even though
+            // nothing was bought). Skip the tick entirely.
+            console.log("⚠️   Buy TX failed — skipping state update to prevent phantom position.");
+            return;
+        }
+        // For sells: the position is considered closed regardless of TX outcome
+        // (the simulation tracks intent, not on-chain confirmation for sells).
     }
 
     // ── P&L calculation (only on sell) ───────────────────────────────────────
@@ -243,8 +367,9 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
     let pnl_usd: number | null = null;
     let pnl_ckb: number | null = null;
 
-    if (isSell && agentState.lastBuyPrice !== null && agentState.lastBuyAmount !== null) {
-        pnl_usd = agentState.lastBuyAmount * (currentPrice - agentState.lastBuyPrice);
+    if (isSell && agentState.lastBuyPrice !== null) {
+        // Use the full closed position size (= capital_in_trading) for accurate P&L.
+        pnl_usd = amount * (currentPrice - agentState.lastBuyPrice);
         pnl_ckb = pnl_usd / currentPrice;
         const sign = pnl_usd >= 0 ? "+" : "";
         console.log(`📈  P&L: ${sign}${pnl_usd.toFixed(4)} USD  (${sign}${pnl_ckb.toFixed(2)} CKB)`);
@@ -258,15 +383,19 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
     // ── Update in-memory state ────────────────────────────────────────────────
     if (isBuy) {
         agentState.remainingCapital -= amount;
+        agentState.capitalInTrading += amount;
         agentState.lastBuyPrice  = currentPrice;
         agentState.lastBuyAmount = amount;
+        agentState.lastBuyTxHash = txHash ?? null;  // track for confirmation check on next sell
     } else if (isSell) {
         // Return the original stake AND apply the P&L.
         // pnl_ckb is positive on a win (capital grows) and negative on a loss
         // (capital shrinks) — this is the core of the simulation accounting.
         agentState.remainingCapital += amount + (pnl_ckb ?? 0);
+        agentState.capitalInTrading  = 0;
         agentState.lastBuyPrice  = null;
         agentState.lastBuyAmount = null;
+        agentState.lastBuyTxHash = null;
     }
 
     const updatedMartingale = updateMartingaleState(martingale, wasLoss);
@@ -274,8 +403,45 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
     agentState.consecutiveLosses = updatedMartingale.consecutiveLosses;
     stateMap.set(addr, { martingale: updatedMartingale, agentState });
 
+    // ── Real on-chain P&L settlement ─────────────────────────────────────────
+    // Accumulate P&L until it crosses ±61 CKB (CKB minimum cell size), then
+    // settle with a real on-chain transfer between reserve and user wallets.
+    let settleTxHash: string | null = null;
+    let settlementAmount = 0;
+
+    if (isSell && pnl_ckb !== null) {
+        agentState.pendingPnlCkb += pnl_ckb;
+        const pending = agentState.pendingPnlCkb;
+
+        if (pending >= 61) {
+            // Profit: reserve sends CKB to user's trading wallet
+            const result = await sendProfitToUser(tradingAddr, pending, currentPrice);
+            if (result) {
+                settleTxHash    = result.txHash;
+                settlementAmount = result.amountCKB;
+                agentState.pendingPnlCkb = 0;
+                console.log(`💰  Settled +${settlementAmount.toFixed(2)} CKB profit on-chain.`);
+            } else {
+                console.log(`⏳  Profit pending (${pending.toFixed(2)} CKB) — reserve insufficient, will retry.`);
+            }
+        } else if (pending <= -61) {
+            // Loss: user's trading wallet sends CKB to reserve
+            const result = await collectLossFromUser(userSigner, tradingAddr, Math.abs(pending), currentPrice);
+            if (result) {
+                settleTxHash    = result.txHash;
+                settlementAmount = result.amountCKB;
+                agentState.pendingPnlCkb = 0;
+                console.log(`💸  Collected -${settlementAmount.toFixed(2)} CKB loss on-chain.`);
+            } else {
+                console.log(`⏳  Loss pending (${pending.toFixed(2)} CKB) — wallet constrained, will retry.`);
+            }
+        } else {
+            console.log(`⏳  P&L pending (${pending.toFixed(2)} CKB) — below 61 CKB threshold, accumulating.`);
+        }
+    }
+
     // ── Persist trade ─────────────────────────────────────────────────────────
-    await saveTrade({
+    const tradeId = await saveTrade({
         wallet_address: addr,
         type: isBuy ? "buy" : "sell",
         amount,
@@ -286,7 +452,12 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
         explorer_link: explorerLink,
         pnl_ckb,
         pnl_usd,
+        profit_tx_hash: settleTxHash,
     });
+
+    // If settlement happened after trade save, ensure profit_tx_hash is set
+    // (already passed above; this path handles future async settle flows)
+    void tradeId;
 
     // ── Persist stats + position to DB ────────────────────────────────────────
     // total_capital is the simulation capital — set on a sell to reflect P&L.
@@ -297,7 +468,8 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
     };
 
     if (isBuy) {
-        dbUpdate.capital_in_trading = (settings.capital_in_trading ?? 0) + amount;
+        // Use in-memory capitalInTrading — avoids stale DB read causing off-by-one.
+        dbUpdate.capital_in_trading = agentState.capitalInTrading;
         dbUpdate.last_buy_price     = currentPrice;
         dbUpdate.last_buy_amount    = amount;
     }
@@ -308,6 +480,7 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
         dbUpdate.capital_in_trading = 0;
         dbUpdate.last_buy_price     = null;
         dbUpdate.last_buy_amount    = null;
+        dbUpdate.pending_pnl_ckb    = agentState.pendingPnlCkb;
         if (wasLoss) {
             dbUpdate.loss_count = (settings.loss_count ?? 0) + 1;
         } else {
@@ -322,10 +495,14 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
         dbUpdate.martingale_count = (settings.martingale_count ?? 0) + 1;
     }
 
-    await db
+    const { error: dbErr } = await db
         .from("agent_settings")
         .update(dbUpdate)
         .eq("wallet_address", addr);
+
+    if (dbErr) {
+        console.error("❌  DB update failed (capital_in_trading may be stale):", dbErr.message);
+    }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -341,19 +518,18 @@ async function saveTrade(trade: {
     explorer_link?: string;
     pnl_ckb?: number | null;
     pnl_usd?: number | null;
-}) {
-    const { error } = await db.from("trades").insert({
+    profit_tx_hash?: string | null;
+}): Promise<string | null> {
+    const { data, error } = await db.from("trades").insert({
         ...trade,
         timestamp: new Date().toISOString(),
-    });
-    if (error) console.error("❌  Failed to save trade:", error.message);
+    }).select("id").single();
+    if (error) { console.error("❌  Failed to save trade:", error.message); return null; }
+    return data?.id ?? null;
 }
 
-// ─── Start loop ───────────────────────────────────────────────────────────────
+// ─── Exports ──────────────────────────────────────────────────────────────────
+// `tick` is exported so it can be called from an API route (Vercel Cron) or
+// directly by the standalone runner (agent/run.ts → Render / local).
 
-console.log("🚀  CAIT Agent starting on CKB Testnet...");
-console.log(`⏱  Interval: ${INTERVAL_MS / 1000}s`);
-console.log("🔑  Using per-user trading wallets (no shared agent key required)\n");
-
-tick(); // run immediately on start
-setInterval(tick, INTERVAL_MS);
+export { tick };

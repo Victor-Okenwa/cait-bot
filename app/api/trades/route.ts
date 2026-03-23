@@ -4,8 +4,11 @@ import { createServiceClient } from "@/lib/supabase";
 export async function GET(req: NextRequest) {
     const { searchParams } = new URL(req.url);
     const wallet = searchParams.get("wallet");
-    const limit = Math.min(parseInt(searchParams.get("limit") ?? "50"), 200);
-    const type = searchParams.get("type"); // optional filter: buy | sell | hold | wait                                          
+    const pageSize = Math.min(parseInt(searchParams.get("limit") ?? "25"), 200);
+    const offset = Math.max(parseInt(searchParams.get("offset") ?? "0"), 0);
+    const sortCol = searchParams.get("sort") ?? "timestamp"; // column to sort by
+    const sortDir = searchParams.get("dir") ?? "desc"; // asc | desc
+    const type = searchParams.get("type"); // optional filter: buy | sell | hold | wait
 
     if (!wallet) {
         return NextResponse.json(
@@ -18,22 +21,22 @@ export async function GET(req: NextRequest) {
 
     let query = db
         .from("trades")
-        .select("*")
+        .select("*", { count: "exact" })
         .eq("wallet_address", wallet)
-        .order("timestamp", { ascending: false })
-        .limit(limit);
+        .order(sortCol, { ascending: sortDir === "asc" })
+        .range(offset, offset + pageSize - 1);
 
     if (type) {
         query = query.eq("type", type);
     }
 
-    const { data, error } = await query;
+    const { data, error, count } = await query;
 
     if (error) {
         return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
-    return NextResponse.json({ data, count: data?.length ?? 0 });
+    return NextResponse.json({ data, count: count ?? 0 });
 }
 
 export async function POST(req: NextRequest) {
@@ -85,25 +88,26 @@ export async function POST(req: NextRequest) {
 }
 
 export async function DELETE(req: NextRequest) {
-    const { searchParams } = new URL(req.url);
-    const wallet = searchParams.get("wallet");
-    const id = searchParams.get("id");
+    let body: { wallet: string; ids: string[] };
+    try {
+        body = await req.json();
+    } catch {
+        return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+    }
 
-    if (!wallet) {
+    if (!body.wallet || !Array.isArray(body.ids) || body.ids.length === 0) {
         return NextResponse.json(
-            { error: "wallet query param required" },
+            { error: "wallet and ids[] are required" },
             { status: 400 }
         );
     }
 
     const db = createServiceClient();
-
-    // Delete single trade by id, or all trades for wallet
-    const query = id
-        ? db.from("trades").delete().eq("id", id).eq("wallet_address", wallet)
-        : db.from("trades").delete().eq("wallet_address", wallet);
-
-    const { error } = await query;
+    const { error } = await db
+        .from("trades")
+        .delete()
+        .eq("wallet_address", body.wallet)
+        .in("id", body.ids);
 
     if (error) {
         return NextResponse.json({ error: error.message }, { status: 500 });

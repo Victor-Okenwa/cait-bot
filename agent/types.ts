@@ -17,6 +17,9 @@ export type AgentContext = {
     lastDecision: TradeDecision | null;
     consecutiveLosses: number;
     recentPrices: number[]; // last N prices for trend context
+    // Open position — null when no position is held
+    lastBuyPrice: number | null;
+    lastBuyAmount: number | null;
 };
 
 export type TradeRecord = {
@@ -59,14 +62,19 @@ export type AgentSettings = {
     loss_count: number;
     martingale_count: number;
     total_pnl_ckb: number;
+    // Accumulated unsettled P&L waiting to cross the 61 CKB on-chain minimum
+    pending_pnl_ckb: number;
 };
 
 export type AgentState = {
     walletAddress: string;
     remainingCapital: number;
+    capitalInTrading: number;      // total CKB across all open buy positions
     lastDecision: TradeDecision | null;
     lastTradeWasLoss: boolean;
     consecutiveLosses: number;
     lastBuyPrice: number | null;
     lastBuyAmount: number | null;  // CKB amount of the last buy (for P&L calc)
+    lastBuyTxHash: string | null;  // tx hash of the pending/confirmed buy TX
+    pendingPnlCkb: number;         // unsettled P&L accumulator (real on-chain settlement)
 };

@@ -1,8 +1,5 @@
 import { ccc } from "@ckb-ccc/core";
 
-const CKB_RPC_URL =
-    process.env.NEXT_PUBLIC_CKB_RPC_URL ?? "https://testnet.ckb.dev/rpc";
-
 const EXPLORER_BASE = "https://testnet.explorer.nervos.org/transaction";
 
 export type SendResult = {

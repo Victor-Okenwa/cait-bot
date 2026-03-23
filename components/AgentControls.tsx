@@ -22,13 +22,13 @@ import type { AgentSettings, TradingAddress } from "@/lib/supabase";
 
 type Status = "idle" | "saving" | "saved" | "error";
 
-const STEP_ADJUST  = "Adjusting capital…";
+const STEP_ADJUST = "Adjusting capital…";
 const STEP_DEPOSIT = "Waiting for wallet approval…";
-const STEP_SAVE    = "Saving settings…";
+const STEP_SAVE = "Saving settings…";
 
-const MIN_DEPOSIT      = 800;   // CKB — minimum non-zero deposit
+const MIN_DEPOSIT = 800;   // CKB — minimum non-zero deposit
 const MIN_MAX_PER_TRADE = 200;  // CKB
-const MAX_TRADE_RATIO  = 0.35;  // max_per_trade must be < 35% of total capital
+const MAX_TRADE_RATIO = 0.35;  // max_per_trade must be < 35% of total capital
 
 function stringToHex(str: string): string {
     const bytes = new TextEncoder().encode(str);
@@ -37,23 +37,25 @@ function stringToHex(str: string): string {
 
 export default function AgentControls() {
     const signer = ccc.useSigner();
-    const [address, setAddress]               = useState<string>("");
-    const [status, setStatus]                 = useState<Status>("idle");
-    const [savingMsg, setSavingMsg]           = useState("");
-    const [errorMsg, setErrorMsg]             = useState("");
-    const [loading, setLoading]               = useState(true);
-    const [tradingWallet, setTradingWallet]   = useState<TradingAddress | null>(null);
+    const [address, setAddress] = useState<string>("");
+    const [status, setStatus] = useState<Status>("idle");
+    const [savingMsg, setSavingMsg] = useState("");
+    const [errorMsg, setErrorMsg] = useState("");
+    const [loading, setLoading] = useState(true);
+    const [tradingWallet, setTradingWallet] = useState<TradingAddress | null>(null);
     const [tradingBalance, setTradingBalance] = useState<number | null>(null);
-    const [showKey, setShowKey]               = useState(false);
-    const [copied, setCopied]                 = useState(false);
-    const [currentPrice, setCurrentPrice]     = useState<number | null>(null);
-    const [priceLoading, setPriceLoading]     = useState(false);
+    const [showKey, setShowKey] = useState(false);
+    const [copied, setCopied] = useState(false);
+    const [currentPrice, setCurrentPrice] = useState<number | null>(null);
+    const [priceLoading, setPriceLoading] = useState(false);
+    // Simulation capital stored in DB — preserved across saves so P&L is never wiped.
+    const [existingTotalCapital, setExistingTotalCapital] = useState<number>(0);
 
     const [form, setForm] = useState({
-        likelyBuyPrice:  "",
+        likelyBuyPrice: "",
         likelySellPrice: "",
-        totalCapital:    "",
-        maxPerTrade:     "",
+        totalCapital: "",
+        maxPerTrade: "",
     });
 
     // ── Fetch current CKB price ───────────────────────────────────────────────
@@ -73,7 +75,7 @@ export default function AgentControls() {
     }
 
     function applyCurrentPrice(price: number) {
-        const buy  = price.toFixed(6);
+        const buy = price.toFixed(6);
         const sell = (price * 1.3).toFixed(6);
         setForm((prev) => ({ ...prev, likelyBuyPrice: buy, likelySellPrice: sell }));
     }
@@ -130,11 +132,12 @@ export default function AgentControls() {
             // Settings — populate form
             if (settingsRes.data) {
                 const d = settingsRes.data;
+                setExistingTotalCapital(d.total_capital ?? 0);
                 setForm({
-                    likelyBuyPrice:  String(d.likely_buy_price),
+                    likelyBuyPrice: String(d.likely_buy_price),
                     likelySellPrice: String(d.likely_sell_price),
-                    totalCapital:    "0",
-                    maxPerTrade:     String(d.max_per_trade),
+                    totalCapital: "0",
+                    maxPerTrade: String(d.max_per_trade),
                 });
             } else if (livePrice) {
                 // First time — pre-fill buy/sell from live price
@@ -167,10 +170,10 @@ export default function AgentControls() {
     }
 
     function validate(): string | null {
-        const buy     = parseFloat(form.likelyBuyPrice);
-        const sell    = parseFloat(form.likelySellPrice);
+        const buy = parseFloat(form.likelyBuyPrice);
+        const sell = parseFloat(form.likelySellPrice);
         const deposit = parseFloat(form.totalCapital);
-        const max     = parseFloat(form.maxPerTrade);
+        const max = parseFloat(form.maxPerTrade);
 
         if (!buy || !sell || isNaN(deposit) || form.totalCapital === "" || !max)
             return "All fields are required.";
@@ -276,23 +279,22 @@ export default function AgentControls() {
 
         // ── Step 3: Upsert settings ───────────────────────────────────────────
         setSavingMsg(STEP_SAVE);
-        const newTotalCapital = (tradingBalance ?? 0) + depositAmount;
-        const payload: AgentSettings & Record<string, unknown> = {
-            wallet_address:     address,
-            likely_buy_price:   parseFloat(form.likelyBuyPrice),
-            likely_sell_price:  parseFloat(form.likelySellPrice),
-            total_capital:      newTotalCapital,
-            max_per_trade:      parseFloat(form.maxPerTrade),
-            is_running:         false,
-            trading_address:    tradingWallet,
-            capital_in_trading: 0,
-            last_buy_price:     null,
-            last_buy_amount:    null,
-            win_count:          0,
-            loss_count:         0,
-            martingale_count:   0,
-            total_pnl_ckb:      0,
-            updated_at:         new Date().toISOString(),
+        // total_capital = existing simulation capital + new deposit.
+        // We NEVER use tradingBalance here — it reflects the raw on-chain amount
+        // which doesn't change with simulation P&L (only real CKB moves).
+        const newTotalCapital = existingTotalCapital + depositAmount;
+        const payload: Partial<AgentSettings> & Record<string, unknown> = {
+            wallet_address:    address,
+            likely_buy_price:  parseFloat(form.likelyBuyPrice),
+            likely_sell_price: parseFloat(form.likelySellPrice),
+            total_capital:     newTotalCapital,
+            max_per_trade:     parseFloat(form.maxPerTrade),
+            trading_address:   tradingWallet,
+            updated_at:        new Date().toISOString(),
+            // capital_in_trading, last_buy_price, last_buy_amount,
+            // win_count, loss_count, martingale_count, total_pnl_ckb
+            // are intentionally omitted — they belong to the agent loop
+            // and must never be reset by the settings form.
         };
 
         const { error: upsertErr } = await supabase
@@ -304,6 +306,7 @@ export default function AgentControls() {
             setStatus("error");
         } else {
             setStatus("saved");
+            setExistingTotalCapital(newTotalCapital);
             if (tradingWallet?.address) fetchBalance(tradingWallet.address);
             setTimeout(() => setStatus("idle"), 3500);
         }
@@ -338,262 +341,260 @@ export default function AgentControls() {
         );
     }
 
-    const depositAmt      = parseFloat(form.totalCapital) || 0;
+    const depositAmt = parseFloat(form.totalCapital) || 0;
     const totalAfterDeposit = (tradingBalance ?? 0) + depositAmt;
-    const maxAllowed      = totalAfterDeposit * MAX_TRADE_RATIO;
+    const maxAllowed = totalAfterDeposit * MAX_TRADE_RATIO;
 
     return (
-        <TooltipProvider>
-            <Card className="bg-white/5 border-white/10 text-white">
-                <CardHeader className="pb-3">
-                    <CardTitle className="text-base text-white/80 flex items-center gap-2">
-                        <Bot className="w-4 h-4 text-cyan-400" />
-                        Automate your trading with AI
-                    </CardTitle>
-                </CardHeader>
+        <Card className="bg-white/5 border-white/10 text-white">
+            <CardHeader className="pb-3">
+                <CardTitle className="text-base text-white/80 flex items-center gap-2">
+                    <Bot className="w-4 h-4 text-cyan-400" />
+                    Automate your trading with AI
+                </CardTitle>
+            </CardHeader>
 
-                <CardContent className="space-y-4">
+            <CardContent className="space-y-4">
 
-                    {/* ── Trading Wallet Info ── */}
-                    <div className="rounded-xl border border-cyan-500/20 bg-cyan-500/5 p-3 space-y-2">
-                        <div className="flex items-center gap-2 text-[11px] text-cyan-400/80 font-medium uppercase tracking-wide">
-                            <Wallet2 className="w-3.5 h-3.5" />
-                            Your Trading Wallet
-                        </div>
+                {/* ── Trading Wallet Info ── */}
+                <div className="rounded-xl border border-cyan-500/20 bg-cyan-500/5 p-3 space-y-2">
+                    <div className="flex items-center gap-2 text-[11px] text-cyan-400/80 font-medium uppercase tracking-wide">
+                        <Wallet2 className="w-3.5 h-3.5" />
+                        Your Trading Wallet
+                    </div>
 
-                        {tradingWallet ? (
-                            <>
-                                <div className="space-y-0.5">
-                                    <p className="text-[10px] text-white/30">Address</p>
-                                    <div className="flex items-center gap-1.5">
-                                        <p className="text-[11px] font-mono text-cyan-300 truncate flex-1">
-                                            {tradingWallet.address}
-                                        </p>
-                                        <button
-                                            onClick={handleCopy}
-                                            className="shrink-0 text-white/30 hover:text-cyan-400 transition-colors"
-                                            title="Copy address"
-                                        >
-                                            {copied
-                                                ? <Check className="w-3.5 h-3.5 text-emerald-400" />
-                                                : <Copy className="w-3.5 h-3.5" />
-                                            }
-                                        </button>
-                                    </div>
+                    {tradingWallet ? (
+                        <>
+                            <div className="space-y-0.5">
+                                <p className="text-[10px] text-white/30">Address</p>
+                                <div className="flex items-center gap-1.5">
+                                    <p className="text-[11px] font-mono text-cyan-300 truncate flex-1">
+                                        {tradingWallet.address}
+                                    </p>
+                                    <button
+                                        onClick={handleCopy}
+                                        className="shrink-0 text-white/30 hover:text-cyan-400 transition-colors"
+                                        title="Copy address"
+                                    >
+                                        {copied
+                                            ? <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                            : <Copy className="w-3.5 h-3.5" />
+                                        }
+                                    </button>
                                 </div>
+                            </div>
 
-                                <div className="space-y-0.5">
-                                    <p className="text-[10px] text-white/30">Private Key</p>
-                                    <div className="flex items-center gap-1.5">
-                                        <p className="text-[11px] font-mono text-white/50 truncate flex-1">
-                                            {showKey
-                                                ? tradingWallet.private_key
-                                                : "••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••"
-                                            }
-                                        </p>
-                                        <button
-                                            onClick={() => setShowKey((v) => !v)}
-                                            className="shrink-0 text-white/30 hover:text-cyan-400 transition-colors"
-                                        >
-                                            {showKey
-                                                ? <EyeOff className="w-3.5 h-3.5" />
-                                                : <Eye className="w-3.5 h-3.5" />
-                                            }
-                                        </button>
-                                    </div>
-                                </div>
-
-                                <div className="flex items-center justify-between pt-0.5">
-                                    <p className="text-[10px] text-white/30">On-chain Balance</p>
-                                    <p className="text-[11px] font-mono font-semibold text-cyan-300">
-                                        {tradingBalance === null
-                                            ? <span className="text-white/20">loading…</span>
-                                            : `${tradingBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} CKB`
+                            <div className="space-y-0.5">
+                                <p className="text-[10px] text-white/30">Private Key</p>
+                                <div className="flex items-center gap-1.5">
+                                    <p className="text-[11px] font-mono text-white/50 truncate flex-1">
+                                        {showKey
+                                            ? tradingWallet.private_key
+                                            : "••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••"
                                         }
                                     </p>
+                                    <button
+                                        onClick={() => setShowKey((v) => !v)}
+                                        className="shrink-0 text-white/30 hover:text-cyan-400 transition-colors"
+                                    >
+                                        {showKey
+                                            ? <EyeOff className="w-3.5 h-3.5" />
+                                            : <Eye className="w-3.5 h-3.5" />
+                                        }
+                                    </button>
                                 </div>
-
-                                <p className="text-[10px] text-white/20 leading-tight">
-                                    Capital is deposited here when you save settings.
-                                    The agent trades exclusively from this address.
-                                </p>
-                            </>
-                        ) : (
-                            <div className="flex items-center gap-2 text-[11px] text-white/30">
-                                <Loader2 className="w-3 h-3 animate-spin" />
-                                Generating trading wallet…
                             </div>
-                        )}
+
+                            <div className="flex items-center justify-between pt-0.5">
+                                <p className="text-[10px] text-white/30">On-chain Balance</p>
+                                <p className="text-[11px] font-mono font-semibold text-cyan-300">
+                                    {tradingBalance === null
+                                        ? <span className="text-white/20">loading…</span>
+                                        : `${tradingBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} CKB`
+                                    }
+                                </p>
+                            </div>
+
+                            <p className="text-[10px] text-white/20 leading-tight">
+                                Capital is deposited here when you save settings.
+                                The agent trades exclusively from this address.
+                            </p>
+                        </>
+                    ) : (
+                        <div className="flex items-center gap-2 text-[11px] text-white/30">
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                            Generating trading wallet…
+                        </div>
+                    )}
+                </div>
+
+                {/* ── Settings form ── */}
+                <div className="grid grid-cols-2 gap-4">
+
+                    {/* Likely Buy Price */}
+                    <div className="space-y-1.5">
+                        <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-1">
+                                <Label className="text-xs text-white/50">Likely Buy Price (USD)</Label>
+                                <Tooltip>
+                                    <TooltipTrigger asChild>
+                                        <Info className="w-3 h-3 text-white/25 cursor-help" />
+                                    </TooltipTrigger>
+                                    <TooltipContent side="top" className="max-w-[220px] size-fit text-center">
+                                        The price at which the agent looks to open a buy position.
+                                        Pre-filled with the live CKB rate. The agent acts within ±25% of this value.
+                                    </TooltipContent>
+                                </Tooltip>
+                            </div>
+                            <button
+                                onClick={handleRefreshPrice}
+                                disabled={priceLoading}
+                                className="flex items-center gap-1 text-[10px] text-cyan-400/60 hover:text-cyan-400 transition-colors disabled:opacity-40"
+                                title="Use live rate"
+                            >
+                                <RefreshCw className={`w-2.5 h-2.5 ${priceLoading ? "animate-spin" : ""}`} />
+                                {currentPrice ? `$${currentPrice.toFixed(6)}` : "live rate"}
+                            </button>
+                        </div>
+                        <Input
+                            placeholder="e.g. 0.001500"
+                            value={form.likelyBuyPrice}
+                            onChange={(e) => handleChange("likelyBuyPrice", e.target.value)}
+                            className="bg-white/5 border-white/10 text-white placeholder:text-white/20 focus:border-cyan-500"
+                        />
                     </div>
 
-                    {/* ── Settings form ── */}
-                    <div className="grid grid-cols-2 gap-4">
-
-                        {/* Likely Buy Price */}
-                        <div className="space-y-1.5">
-                            <div className="flex items-center justify-between">
-                                <div className="flex items-center gap-1">
-                                    <Label className="text-xs text-white/50">Likely Buy Price (USD)</Label>
-                                    <Tooltip>
-                                        <TooltipTrigger asChild>
-                                            <Info className="w-3 h-3 text-white/25 cursor-help" />
-                                        </TooltipTrigger>
-                                        <TooltipContent side="top" className="max-w-[220px] text-center">
-                                            The price at which the agent looks to open a buy position.
-                                            Pre-filled with the live CKB rate. The agent acts within ±25% of this value.
-                                        </TooltipContent>
-                                    </Tooltip>
-                                </div>
-                                <button
-                                    onClick={handleRefreshPrice}
-                                    disabled={priceLoading}
-                                    className="flex items-center gap-1 text-[10px] text-cyan-400/60 hover:text-cyan-400 transition-colors disabled:opacity-40"
-                                    title="Use live rate"
-                                >
-                                    <RefreshCw className={`w-2.5 h-2.5 ${priceLoading ? "animate-spin" : ""}`} />
-                                    {currentPrice ? `$${currentPrice.toFixed(6)}` : "live rate"}
-                                </button>
-                            </div>
-                            <Input
-                                placeholder="e.g. 0.001500"
-                                value={form.likelyBuyPrice}
-                                onChange={(e) => handleChange("likelyBuyPrice", e.target.value)}
-                                className="bg-white/5 border-white/10 text-white placeholder:text-white/20 focus:border-cyan-500"
-                            />
-                        </div>
-
-                        {/* Likely Sell Price */}
-                        <div className="space-y-1.5">
-                            <div className="flex items-center justify-between">
-                                <div className="flex items-center gap-1">
-                                    <Label className="text-xs text-white/50">Likely Sell Price (USD)</Label>
-                                    <Tooltip>
-                                        <TooltipTrigger asChild>
-                                            <Info className="w-3 h-3 text-white/25 cursor-help" />
-                                        </TooltipTrigger>
-                                        <TooltipContent side="top" className="max-w-[220px] text-center">
-                                            The price at which the agent targets closing a position for profit.
-                                            Pre-filled at +30% above the live rate. Must be higher than your buy price.
-                                        </TooltipContent>
-                                    </Tooltip>
-                                </div>
-                                {currentPrice && (
-                                    <span className="text-[10px] text-emerald-400/60">
-                                        +30% = ${(currentPrice * 1.3).toFixed(6)}
-                                    </span>
-                                )}
-                            </div>
-                            <Input
-                                placeholder="e.g. 0.001950"
-                                value={form.likelySellPrice}
-                                onChange={(e) => handleChange("likelySellPrice", e.target.value)}
-                                className="bg-white/5 border-white/10 text-white placeholder:text-white/20 focus:border-cyan-500"
-                            />
-                        </div>
-
-                        {/* Deposit Capital */}
-                        <div className="space-y-1.5">
+                    {/* Likely Sell Price */}
+                    <div className="space-y-1.5">
+                        <div className="flex items-center justify-between">
                             <div className="flex items-center gap-1">
-                                <Label className="text-xs text-white/50">Deposit Capital (CKB)</Label>
+                                <Label className="text-xs text-white/50">Likely Sell Price (USD)</Label>
                                 <Tooltip>
                                     <TooltipTrigger asChild>
                                         <Info className="w-3 h-3 text-white/25 cursor-help" />
                                     </TooltipTrigger>
-                                    <TooltipContent side="top" className="max-w-[240px]">
-                                        <p>Amount to add to your trading wallet this session.</p>
-                                        <p className="mt-1 text-white/70">• Minimum deposit: <strong>800 CKB</strong></p>
-                                        <p className="text-white/70">• Enter <strong>0</strong> to update settings only — only allowed if your wallet already holds more than 799 CKB.</p>
+                                    <TooltipContent side="top" className="max-w-[220px] size-fit text-center">
+                                        The price at which the agent targets closing a position for profit.
+                                        Pre-filled at +30% above the live rate. Must be higher than your buy price.
                                     </TooltipContent>
                                 </Tooltip>
                             </div>
-                            <Input
-                                placeholder="0"
-                                value={form.totalCapital}
-                                onChange={(e) => handleChange("totalCapital", e.target.value)}
-                                className="bg-white/5 border-white/10 text-white placeholder:text-white/20 focus:border-cyan-500"
-                            />
-                            {(() => {
-                                const amt = parseFloat(form.totalCapital);
-                                if (amt > 0 && tradingBalance !== null) {
-                                    const newTotal = tradingBalance + amt;
-                                    return (
-                                        <p className="text-[10px] text-cyan-300/70 leading-tight">
-                                            {tradingBalance.toFixed(2)} + {amt.toFixed(2)} = <span className="font-semibold">{newTotal.toFixed(2)} CKB</span> total
-                                        </p>
-                                    );
-                                }
-                                return null;
-                            })()}
-                        </div>
-
-                        {/* Max Per Trade */}
-                        <div className="space-y-1.5">
-                            <div className="flex items-center gap-1">
-                                <Label className="text-xs text-white/50">Max Per Trade (CKB)</Label>
-                                <Tooltip>
-                                    <TooltipTrigger asChild>
-                                        <Info className="w-3 h-3 text-white/25 cursor-help" />
-                                    </TooltipTrigger>
-                                    <TooltipContent side="top" className="max-w-[240px]">
-                                        <p>Upper bound for a single trade position.</p>
-                                        <p className="mt-1 text-white/70">• Minimum: <strong>200 CKB</strong></p>
-                                        <p className="text-white/70">• Must be below <strong>35% of total capital</strong> to keep risk in check.</p>
-                                        <p className="mt-1 text-white/70">The agent trades at <strong>half this amount</strong> normally, and steps up to the full amount after a loss (Martingale).</p>
-                                    </TooltipContent>
-                                </Tooltip>
-                            </div>
-                            <Input
-                                placeholder="e.g. 400"
-                                value={form.maxPerTrade}
-                                onChange={(e) => handleChange("maxPerTrade", e.target.value)}
-                                className="bg-white/5 border-white/10 text-white placeholder:text-white/20 focus:border-cyan-500"
-                            />
-                            {totalAfterDeposit > 0 && (
-                                <p className="text-[10px] text-white/25 leading-tight">
-                                    Max allowed: {maxAllowed > 0 ? `${Math.floor(maxAllowed)} CKB` : "—"} (35% of {totalAfterDeposit.toFixed(0)} CKB)
-                                </p>
+                            {currentPrice && (
+                                <span className="text-[10px] text-emerald-400/60">
+                                    +30% = ${(currentPrice * 1.3).toFixed(6)}
+                                </span>
                             )}
                         </div>
+                        <Input
+                            placeholder="e.g. 0.001950"
+                            value={form.likelySellPrice}
+                            onChange={(e) => handleChange("likelySellPrice", e.target.value)}
+                            className="bg-white/5 border-white/10 text-white placeholder:text-white/20 focus:border-cyan-500"
+                        />
                     </div>
 
-                    {/* Status messages */}
-                    {status === "saving" && (
-                        <div className="flex items-center gap-2 text-cyan-400 text-xs bg-cyan-400/10 border border-cyan-400/20 rounded-lg px-3 py-2">
-                            <Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin" />
-                            {savingMsg}
+                    {/* Deposit Capital */}
+                    <div className="space-y-1.5">
+                        <div className="flex items-center gap-1">
+                            <Label className="text-xs text-white/50">Deposit Capital (CKB)</Label>
+                            <Tooltip>
+                                <TooltipTrigger asChild>
+                                    <Info className="w-3 h-3 text-white/25 cursor-help" />
+                                </TooltipTrigger>
+                                <TooltipContent side="top" className="max-w-[220px] size-fit text-center flex flex-col *:flex-1 *:text-center">
+                                    Amount to add to your trading wallet this session
+                                    <span className="mt-1 text-black/70">• Minimum deposit: <strong>800 CKB</strong></span>
+                                    <span className="text-black/70">• Enter <strong>0</strong> to update settings only — only allowed if your wallet already holds more than 799 CKB.</span>
+                                </TooltipContent>
+                            </Tooltip>
                         </div>
-                    )}
-                    {status === "error" && (
-                        <div className="flex items-center gap-2 text-red-400 text-xs bg-red-400/10 border border-red-400/20 rounded-lg px-3 py-2">
-                            <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                            {errorMsg}
-                        </div>
-                    )}
-                    {status === "saved" && (
-                        <div className="flex items-center gap-2 text-emerald-400 text-xs bg-emerald-400/10 border border-emerald-400/20 rounded-lg px-3 py-2">
-                            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                            Settings saved. Use the toggle in Agent Stats to start trading.
-                        </div>
-                    )}
-
-                    <div className="flex items-center justify-between pt-1">
-                        <p className="text-[10px] text-white/25">
-                            Wallet: {address ? address.slice(0, 14) + "…" : "—"}
-                        </p>
-                        <Button
-                            onClick={handleSave}
-                            disabled={status === "saving" || !tradingWallet}
-                            className="bg-cyan-600 hover:bg-cyan-500 text-white text-sm gap-2"
-                        >
-                            {status === "saving"
-                                ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                : <Save className="w-3.5 h-3.5" />
+                        <Input
+                            placeholder="0"
+                            value={form.totalCapital}
+                            onChange={(e) => handleChange("totalCapital", e.target.value)}
+                            className="bg-white/5 border-white/10 text-white placeholder:text-white/20 focus:border-cyan-500"
+                        />
+                        {(() => {
+                            const amt = parseFloat(form.totalCapital);
+                            if (amt > 0 && tradingBalance !== null) {
+                                const newTotal = tradingBalance + amt;
+                                return (
+                                    <p className="text-[10px] text-cyan-300/70 leading-tight">
+                                        {tradingBalance.toFixed(2)} + {amt.toFixed(2)} = <span className="font-semibold">{newTotal.toFixed(2)} CKB</span> total
+                                    </p>
+                                );
                             }
-                            {status === "saving" ? "Processing…" : "Save Settings"}
-                        </Button>
+                            return null;
+                        })()}
                     </div>
-                </CardContent>
-            </Card>
-        </TooltipProvider>
+
+                    {/* Max Per Trade */}
+                    <div className="space-y-1.5">
+                        <div className="flex items-center gap-1">
+                            <Label className="text-xs text-white/50">Max Per Trade (CKB)</Label>
+                            <Tooltip>
+                                <TooltipTrigger asChild>
+                                    <Info className="w-3 h-3 text-white/25 cursor-help" />
+                                </TooltipTrigger>
+                                <TooltipContent side="top" className="max-w-[240px] flex  flex-col *:flex-1 *:text-center">
+                                    Upper bound for a single trade position.
+                                    <span className="mt-1 text-black/70">• Minimum: <strong>200 CKB</strong></span>
+                                    <span className="text-black/70">• Must be below <strong>35% of total capital</strong> to keep risk in check.</span>
+                                    <span className="mt-1 text-black/70">The agent trades at <strong>half this amount</strong> normally, and steps up to the full amount after a loss (Martingale).</span>
+                                </TooltipContent>
+                            </Tooltip>
+                        </div>
+                        <Input
+                            placeholder="e.g. 400"
+                            value={form.maxPerTrade}
+                            onChange={(e) => handleChange("maxPerTrade", e.target.value)}
+                            className="bg-white/5 border-white/10 text-white placeholder:text-white/20 focus:border-cyan-500"
+                        />
+                        {totalAfterDeposit > 0 && (
+                            <p className="text-[10px] text-white/25 leading-tight">
+                                Max allowed: {maxAllowed > 0 ? `${Math.floor(maxAllowed)} CKB` : "—"} (35% of {totalAfterDeposit.toFixed(0)} CKB)
+                            </p>
+                        )}
+                    </div>
+                </div>
+
+                {/* Status messages */}
+                {status === "saving" && (
+                    <div className="flex items-center gap-2 text-cyan-400 text-xs bg-cyan-400/10 border border-cyan-400/20 rounded-lg px-3 py-2">
+                        <Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin" />
+                        {savingMsg}
+                    </div>
+                )}
+                {status === "error" && (
+                    <div className="flex items-center gap-2 text-red-400 text-xs bg-red-400/10 border border-red-400/20 rounded-lg px-3 py-2">
+                        <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                        {errorMsg}
+                    </div>
+                )}
+                {status === "saved" && (
+                    <div className="flex items-center gap-2 text-emerald-400 text-xs bg-emerald-400/10 border border-emerald-400/20 rounded-lg px-3 py-2">
+                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                        Settings saved. Use the toggle in Agent Stats to start trading.
+                    </div>
+                )}
+
+                <div className="flex items-center justify-between pt-1">
+                    <p className="text-[10px] text-white/25">
+                        Wallet: {address ? address.slice(0, 14) + "…" : "—"}
+                    </p>
+                    <Button
+                        onClick={handleSave}
+                        disabled={status === "saving" || !tradingWallet}
+                        className="bg-cyan-600 hover:bg-cyan-500 text-white text-sm gap-2"
+                    >
+                        {status === "saving"
+                            ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            : <Save className="w-3.5 h-3.5" />
+                        }
+                        {status === "saving" ? "Processing…" : "Save Settings"}
+                    </Button>
+                </div>
+            </CardContent>
+        </Card>
     );
 }

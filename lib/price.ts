@@ -25,8 +25,8 @@ async function fetchWithRetry(
                 }
             }
             return res;
-        } catch (e: any) {
-            lastErr = e;
+        } catch (e: unknown) {
+            lastErr = e as Error;
             if (i < maxAttempts - 1) {
                 await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, i)));
             }

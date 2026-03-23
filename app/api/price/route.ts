@@ -70,19 +70,18 @@ export async function GET(req: NextRequest) {
     );
     if (!ok) return NextResponse.json({ error: `CoinGecko ${status}` }, { status });
 
-    const ttl = parseInt(days) <= 1 ? 3 * 60_000 : 10 * 60_000;
+    const daysNum = days === "max" ? Infinity : parseInt(days);
+    const ttl = daysNum <= 1 ? 3 * 60_000 : daysNum <= 30 ? 10 * 60_000 : 60 * 60_000;
     toCache(cacheKey, data, ttl);
     return NextResponse.json(data, { headers: { "X-Cache": "MISS" } });
   }
 
-  // ── OHLC (candle) ── cache 3 min for short, 10 min for long ─────────────────
+  // ── OHLC (candle) ── cache 3 min for short, 15 min for long ─────────────────
   if (type === "ohlc") {
     const cacheKey = `ohlc-${days}`;
     const cached = fromCache(cacheKey);
     if (cached) {
-      return NextResponse.json(cached, {
-        headers: { "X-Cache": "HIT" },
-      });
+      return NextResponse.json(cached, { headers: { "X-Cache": "HIT" } });
     }
 
     const { ok, status, data } = await cgFetch(
@@ -90,7 +89,8 @@ export async function GET(req: NextRequest) {
     );
     if (!ok) return NextResponse.json({ error: `CoinGecko ${status}` }, { status });
 
-    const ttl = parseInt(days) <= 1 ? 3 * 60_000 : 10 * 60_000;
+    const daysNum = parseInt(days);
+    const ttl = daysNum <= 1 ? 3 * 60_000 : daysNum <= 30 ? 10 * 60_000 : 15 * 60_000;
     toCache(cacheKey, data, ttl);
     return NextResponse.json(data, { headers: { "X-Cache": "MISS" } });
   }

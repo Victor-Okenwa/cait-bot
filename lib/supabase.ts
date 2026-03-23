@@ -42,6 +42,8 @@ export type AgentSettings = {
     loss_count: number;
     martingale_count: number;
     total_pnl_ckb: number;
+    // Accumulated unsettled P&L waiting to cross the 61 CKB on-chain minimum
+    pending_pnl_ckb: number;
 };
 
 export type Trade = {

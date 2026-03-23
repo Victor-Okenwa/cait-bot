@@ -2,9 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
+  ComposedChart, Bar,
   LineChart, Line,
   AreaChart, Area,
-  ComposedChart, Bar,
   XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer,
 } from "recharts";
@@ -19,56 +19,52 @@ import {
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type ChartType = "line" | "area" | "candle";
-type DurationKey = "1m" | "5m" | "15m" | "30m" | "1h" | "1d" | "30d" | "3mo" | "1y";
+type ChartType   = "line" | "area" | "candle";
+type DurationKey = "1m" | "5m" | "15m" | "30m" | "1h" | "1d" | "30d";
 
-type LivePoint   = { ts: number; price: number };
 type LinePoint   = { time: string; price: number };
 type CandlePoint = { time: string; open: number; high: number; low: number; close: number };
 type ChartPoint  = LinePoint | CandlePoint;
 
 type DurationConfig = {
   label: string;
-  live: boolean;
-  windowMs?: number;
-  days?: number;
+  /** days param for market_chart (line / area) */
+  chartDays: number | "max";
+  /** days param for ohlc (candle) — must be a CoinGecko-supported value:
+   *  1 → 30-min bars | 7/14/30 → 4-hour bars | 90/180/365 → daily bars */
+  ohlcDays: number;
+  description: string;
+  refreshMs: number;
 };
 
-// ─── Config ───────────────────────────────────────────────────────────────────
+// ─── Duration config ──────────────────────────────────────────────────────────
 
 const DURATIONS: Record<DurationKey, DurationConfig> = {
-  "1m":  { label: "1m",  live: true,  windowMs: 60_000 },
-  "5m":  { label: "5m",  live: true,  windowMs: 5  * 60_000 },
-  "15m": { label: "15m", live: true,  windowMs: 15 * 60_000 },
-  "30m": { label: "30m", live: true,  windowMs: 30 * 60_000 },
-  "1h":  { label: "1h",  live: true,  windowMs: 60 * 60_000 },
-  "1d":  { label: "1d",  live: false, days: 1   },
-  "30d": { label: "30d", live: false, days: 30  },
-  "3mo": { label: "3mo", live: false, days: 90  },
-  "1y":  { label: "1y",  live: false, days: 365 },
+  "1m":  { label:"1m",  chartDays:1,     ohlcDays:1,   description:"24h",       refreshMs:60_000     },
+  "5m":  { label:"5m",  chartDays:1,     ohlcDays:1,   description:"24h",       refreshMs:60_000     },
+  "15m": { label:"15m", chartDays:3,     ohlcDays:1,   description:"72h",       refreshMs:5*60_000   },
+  "30m": { label:"30m", chartDays:10,    ohlcDays:7,   description:"10d",       refreshMs:10*60_000  },
+  "1h":  { label:"1h",  chartDays:10,    ohlcDays:14,  description:"10d",       refreshMs:10*60_000  },
+  "1d":  { label:"1d",  chartDays:30,    ohlcDays:90,  description:"30d",       refreshMs:30*60_000  },
+  "30d": { label:"30d", chartDays:"max", ohlcDays:365, description:"All time",  refreshMs:60*60_000  },
 };
 
 const DURATION_KEYS = Object.keys(DURATIONS) as DurationKey[];
-const MAX_LIVE_POINTS = 120;
-const LIVE_POLL_MS    = 60_000;
 
 const CHART_TYPES: { key: ChartType; label: string; Icon: React.ElementType }[] = [
-  { key: "line",   label: "Line",   Icon: LineIcon        },
-  { key: "area",   label: "Area",   Icon: AreaIcon        },
+  { key: "line",   label: "Line",   Icon: LineIcon         },
+  { key: "area",   label: "Area",   Icon: AreaIcon         },
   { key: "candle", label: "Candle", Icon: CandlestickChart },
 ];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function fmtLiveTime(ts: number) {
-  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
-
-function fmtHistTime(ts: number, days: number) {
+function fmtTime(ts: number, days: number | "max"): string {
   const d = new Date(ts);
-  return days <= 1
-    ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-    : d.toLocaleDateString([], { month: "short", day: "numeric" });
+  const n = days === "max" ? 9999 : (days as number);
+  if (n <= 3)  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (n <= 90) return d.toLocaleDateString([], { month: "short", day: "numeric" });
+  return d.toLocaleDateString([], { year: "numeric", month: "short" });
 }
 
 function precision(price: number) {
@@ -78,65 +74,58 @@ function precision(price: number) {
   return 4;
 }
 
-/** Aggregate an array of live points into N candlestick buckets */
-function aggregateCandles(points: LivePoint[], buckets = 24): CandlePoint[] {
-  if (points.length === 0) return [];
-  const size = Math.max(1, Math.ceil(points.length / buckets));
-  const result: CandlePoint[] = [];
-  for (let i = 0; i < points.length; i += size) {
-    const group  = points.slice(i, i + size);
-    const prices = group.map((p) => p.price);
-    result.push({
-      time:  fmtLiveTime(group[0].ts),
-      open:  prices[0],
-      high:  Math.max(...prices),
-      low:   Math.min(...prices),
-      close: prices[prices.length - 1],
-    });
-  }
-  return result;
+function safeMin(arr: number[]) { return arr.reduce((a, b) => Math.min(a, b), Infinity); }
+function safeMax(arr: number[]) { return arr.reduce((a, b) => Math.max(a, b), -Infinity); }
+
+// ─── Candlestick shape ────────────────────────────────────────────────────────
+//
+// Recharts always passes `background` to Bar shape functions — it is the full
+// chart-area rectangle: { x, y, width, height }.  We use it together with the
+// price domain (closed-over minP / maxP) to convert price → pixel Y without
+// relying on the unreliable yAxis.scale reference.
+
+function makeCandlestickShape(minPrice: number, maxPrice: number) {
+  return function CandlestickShape(props: any) {
+    const { x, width, background, open, high, low, close } = props;
+    if (!background?.height) return null;
+    if (open == null || high == null || low == null || close == null) return null;
+
+    const priceRange = maxPrice - minPrice;
+    if (priceRange === 0) return null;
+
+    const toPixel = (p: number) =>
+      background.y + ((maxPrice - p) / priceRange) * background.height;
+
+    const yHigh  = toPixel(high);
+    const yLow   = toPixel(low);
+    const yOpen  = toPixel(open);
+    const yClose = toPixel(close);
+    const isUp   = close >= open;
+    const color  = isUp ? "#22c55e" : "#ef4444";
+    const bodyTop = Math.min(yOpen, yClose);
+    const bodyH   = Math.max(Math.abs(yClose - yOpen), 2);
+    const midX    = x + width / 2;
+    const bodyW   = Math.max(width * 0.7, 2);
+
+    return (
+      <g>
+        {/* Upper wick */}
+        <line x1={midX} y1={yHigh} x2={midX} y2={bodyTop} stroke={color} strokeWidth={1} />
+        {/* Lower wick */}
+        <line x1={midX} y1={bodyTop + bodyH} x2={midX} y2={yLow} stroke={color} strokeWidth={1} />
+        {/* Body */}
+        <rect
+          x={midX - bodyW / 2} y={bodyTop}
+          width={bodyW} height={bodyH}
+          fill={color} fillOpacity={isUp ? 0.25 : 0.85}
+          stroke={color} strokeWidth={1} rx={1}
+        />
+      </g>
+    );
+  };
 }
 
-// ─── Custom candlestick shape ─────────────────────────────────────────────────
-
-function CandlestickBar(props: any) {
-  const { x, width, open, high, low, close, yAxis } = props;
-
-  // Defensive: yAxis.scale may not exist for the very first render tick
-  const scale = yAxis?.scale ?? yAxis?.yScale;
-  if (typeof scale !== "function") return null;
-  if (open == null || high == null || low == null || close == null) return null;
-
-  const yOpen   = scale(open);
-  const yClose  = scale(close);
-  const yHigh   = scale(high);
-  const yLow    = scale(low);
-  const isUp    = close >= open;
-  const color   = isUp ? "#22c55e" : "#ef4444";
-  const bodyTop = Math.min(yOpen, yClose);
-  const bodyH   = Math.max(Math.abs(yClose - yOpen), 1);
-  const cx      = x + width / 2;
-  const barW    = Math.max(width - 3, 2);
-
-  return (
-    <g>
-      {/* Full wick high → low */}
-      <line x1={cx} y1={yHigh} x2={cx} y2={yLow} stroke={color} strokeWidth={1.5} />
-      {/* Body open ↔ close */}
-      <rect
-        x={cx - barW / 2}
-        y={bodyTop}
-        width={barW}
-        height={bodyH}
-        fill={color}
-        fillOpacity={0.85}
-        rx={1}
-      />
-    </g>
-  );
-}
-
-// ─── Custom candle tooltip ────────────────────────────────────────────────────
+// ─── Candle tooltip ───────────────────────────────────────────────────────────
 
 function CandleTooltip({ active, payload, label, prec }: any) {
   if (!active || !payload?.length) return null;
@@ -157,24 +146,15 @@ function CandleTooltip({ active, payload, label, prec }: any) {
   );
 }
 
-// ─── Component ────────────────────────────────────────────────────────────────
+// ─── Fetch with retry ─────────────────────────────────────────────────────────
 
-// ─── Retry fetch helper ───────────────────────────────────────────────────────
-// Retries up to `maxAttempts` times with exponential backoff.
-async function fetchWithRetry(
-  url: string,
-  maxAttempts = 3,
-  baseDelayMs = 1500
-): Promise<Response> {
+async function fetchWithRetry(url: string, maxAttempts = 3, baseDelayMs = 1500): Promise<Response> {
   let lastError: Error = new Error("Unknown fetch error");
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
       const res = await fetch(url);
-      // Retry on 429 (rate limit) or 5xx server errors
       if (res.status === 429 || res.status >= 500) {
-        lastError = new Error(
-          res.status === 429 ? "Rate limited — retrying…" : `Server error ${res.status}`
-        );
+        lastError = new Error(res.status === 429 ? "Rate limited — retrying…" : `Server error ${res.status}`);
         if (attempt < maxAttempts - 1) {
           await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, attempt)));
           continue;
@@ -183,13 +163,14 @@ async function fetchWithRetry(
       return res;
     } catch (e: any) {
       lastError = e;
-      if (attempt < maxAttempts - 1) {
+      if (attempt < maxAttempts - 1)
         await new Promise((r) => setTimeout(r, baseDelayMs * Math.pow(2, attempt)));
-      }
     }
   }
   throw lastError;
 }
+
+// ─── Component ────────────────────────────────────────────────────────────────
 
 export default function PriceChart() {
   const [chartType,        setChartType]        = useState<ChartType>("line");
@@ -200,197 +181,137 @@ export default function PriceChart() {
   const [refetching,       setRefetching]       = useState(false);
   const [error,            setError]            = useState<string | null>(null);
   const [isFullscreen,     setIsFullscreen]     = useState(false);
+  const [fsHeight,         setFsHeight]         = useState(0);
 
-  const liveBuffer    = useRef<LivePoint[]>([]);
-  const containerRef  = useRef<HTMLDivElement>(null);
-  // Track current duration+type for manual refetch
-  const durRef        = useRef<DurationKey>("1h");
-  const typeRef       = useRef<ChartType>("line");
-
-  useEffect(() => { durRef.current  = selectedDuration; }, [selectedDuration]);
-  useEffect(() => { typeRef.current = chartType;        }, [chartType]);
+  const containerRef = useRef<HTMLDivElement>(null);
+  // Plain div — overflow-x:auto gives us full control incl. scrollLeft.
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   // ── Fullscreen ──────────────────────────────────────────────────────────────
 
   function toggleFullscreen() {
-    if (!document.fullscreenElement) {
-      containerRef.current?.requestFullscreen();
-    } else {
-      document.exitFullscreen();
-    }
+    if (!document.fullscreenElement) containerRef.current?.requestFullscreen();
+    else document.exitFullscreen();
   }
 
   useEffect(() => {
-    function onFSChange() { setIsFullscreen(!!document.fullscreenElement); }
+    function onFSChange() {
+      const inFS = !!document.fullscreenElement;
+      setIsFullscreen(inFS);
+      if (inFS) setFsHeight(window.innerHeight);
+    }
     document.addEventListener("fullscreenchange", onFSChange);
     return () => document.removeEventListener("fullscreenchange", onFSChange);
   }, []);
 
-  // ── Live buffer rebuilds ────────────────────────────────────────────────────
+  // ── Scroll to the most-recent (rightmost) bar after data loads ──────────────
 
-  function rebuildFromBuffer(dur: DurationKey, type: ChartType) {
+  useEffect(() => {
+    if (!chartData.length || !scrollRef.current) return;
+    const el = scrollRef.current;
+    // Small delay so Recharts finishes painting before we scroll.
+    setTimeout(() => { el.scrollLeft = el.scrollWidth; }, 80);
+  }, [chartData]);
+
+  // ── Fetch data ──────────────────────────────────────────────────────────────
+  //
+  // Line / area  → market_chart endpoint  → prices: [ts, price][]
+  // Candle       → ohlc endpoint          → [ts, open, high, low, close][]
+  //
+  // Using the OHLC endpoint for candles is essential: market_chart gives a
+  // single price per timestamp, so aggregating it into OHLC produces candles
+  // where open=high=low=close (a dot). The OHLC endpoint gives real spreads.
+
+  async function fetchData(dur: DurationKey, type: ChartType, silent = false) {
     const cfg = DURATIONS[dur];
-    if (!cfg.live || !cfg.windowMs) return;
-    const cutoff   = Date.now() - cfg.windowMs;
-    const filtered = liveBuffer.current.filter((p) => p.ts >= cutoff);
-    if (type === "candle") {
-      setChartData(aggregateCandles(filtered));
-    } else {
-      setChartData(filtered.map((p) => ({ time: fmtLiveTime(p.ts), price: p.price })));
-    }
-  }
-
-  // ── Historical: line/area — uses /api/price proxy ───────────────────────────
-
-  async function fetchHistoricalLine(days: number) {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await fetchWithRetry(`/api/price?type=chart&days=${days}`);
-      if (!res.ok) throw new Error(`Price API ${res.status}`);
-      const json = await res.json();
-      if (json.error) throw new Error(json.error);
-      const prices: [number, number][] = json.prices ?? [];
-      const step    = Math.max(1, Math.floor(prices.length / 120));
-      const sampled = prices.filter((_, i) => i % step === 0);
-      setChartData(sampled.map(([ts, price]) => ({ time: fmtHistTime(ts, days), price })));
-      if (prices.length) setCurrentPrice(prices[prices.length - 1][1]);
-    } catch (e: any) {
-      setError(e.message ?? "Fetch failed");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  // ── Historical: candle — uses /api/price proxy ───────────────────────────────
-
-  async function fetchHistoricalOHLC(days: number) {
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await fetchWithRetry(`/api/price?type=ohlc&days=${days}`);
-      if (!res.ok) throw new Error(`Price API ${res.status}`);
-      const raw: [number, number, number, number, number][] = await res.json();
-      const step    = Math.max(1, Math.floor(raw.length / 120));
-      const sampled = raw.filter((_, i) => i % step === 0);
-      setChartData(sampled.map(([ts, o, h, l, c]) => ({
-        time: fmtHistTime(ts, days), open: o, high: h, low: l, close: c,
-      })));
-      if (raw.length) setCurrentPrice(raw[raw.length - 1][4]);
-    } catch (e: any) {
-      setError(e.message ?? "Fetch failed");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  // ── Live price polling — uses /api/price proxy ──────────────────────────────
-
-  async function fetchLivePrice(isManual = false) {
-    if (isManual) setRefetching(true);
-    try {
-      const res = await fetchWithRetry("/api/price?type=simple");
-      if (!res.ok) throw new Error(`Price API ${res.status}`);
-      const json  = await res.json();
-      if (json.error) throw new Error(json.error);
-      const price = json["nervos-network"]?.usd as number;
-      if (!price) throw new Error("No price in response");
-
-      liveBuffer.current.push({ ts: Date.now(), price });
-      if (liveBuffer.current.length > MAX_LIVE_POINTS) liveBuffer.current.shift();
-
-      setCurrentPrice(price);
-      setError(null);
-
-      setSelectedDuration((dur) => {
-        if (DURATIONS[dur].live) {
-          setChartType((type) => { rebuildFromBuffer(dur, type); return type; });
-        }
-        return dur;
-      });
-    } catch (e: any) {
-      setError(e.message ?? "Fetch failed");
-    } finally {
-      setLoading(false);
-      if (isManual) setRefetching(false);
-    }
-  }
-
-  // ── Manual refetch (button) ───────────────────────────────────────────────
-
-  async function handleManualRefetch() {
-    const dur  = durRef.current;
-    const type = typeRef.current;
-    const cfg  = DURATIONS[dur];
-
-    setRefetching(true);
+    if (!silent) setLoading(true);
+    else         setRefetching(true);
     setError(null);
 
-    if (cfg.live) {
-      await fetchLivePrice(true);
-    } else {
+    try {
       if (type === "candle") {
-        await fetchHistoricalOHLC(cfg.days!);
+        // ── OHLC ─────────────────────────────────────────────────────────────
+        const res = await fetchWithRetry(`/api/price?type=ohlc&days=${cfg.ohlcDays}`);
+        if (!res.ok) throw new Error(`Price API ${res.status}`);
+        const raw: [number, number, number, number, number][] = await res.json();
+        if (!Array.isArray(raw) || raw.length === 0) throw new Error("No OHLC data");
+
+        setCurrentPrice(raw[raw.length - 1][4]);
+        setChartData(raw.map(([ts, o, h, l, c]) => ({
+          time: fmtTime(ts, cfg.ohlcDays),
+          open: o, high: h, low: l, close: c,
+        })));
       } else {
-        await fetchHistoricalLine(cfg.days!);
+        // ── Market chart (line / area) ────────────────────────────────────────
+        const res = await fetchWithRetry(`/api/price?type=chart&days=${cfg.chartDays}`);
+        if (!res.ok) throw new Error(`Price API ${res.status}`);
+        const json = await res.json();
+        if (json.error) throw new Error(json.error);
+        const prices: [number, number][] = json.prices ?? [];
+        if (!prices.length) throw new Error("No price data");
+
+        setCurrentPrice(prices[prices.length - 1][1]);
+        setChartData(prices.map(([ts, price]) => ({ time: fmtTime(ts, cfg.chartDays), price })));
       }
+    } catch (e: any) {
+      setError(e.message ?? "Fetch failed");
+    } finally {
+      setLoading(false);
       setRefetching(false);
     }
   }
 
-  // ── On duration or chart type change ─────────────────────────────────────────
+  // ── Refetch on duration / chart-type change ─────────────────────────────────
+
+  useEffect(() => { fetchData(selectedDuration, chartType); }, [selectedDuration, chartType]);
+
+  // ── Background auto-refresh ─────────────────────────────────────────────────
 
   useEffect(() => {
     const cfg = DURATIONS[selectedDuration];
-    if (cfg.live) {
-      rebuildFromBuffer(selectedDuration, chartType);
-    } else {
-      if (chartType === "candle") {
-        fetchHistoricalOHLC(cfg.days!);
-      } else {
-        fetchHistoricalLine(cfg.days!);
-      }
-    }
+    const id = setInterval(() => fetchData(selectedDuration, chartType, true), cfg.refreshMs);
+    return () => clearInterval(id);
   }, [selectedDuration, chartType]);
 
-  // ── Start live poll ───────────────────────────────────────────────────────
+  // ── Manual refetch ──────────────────────────────────────────────────────────
 
-  useEffect(() => {
-    fetchLivePrice();
-    const id = setInterval(fetchLivePrice, LIVE_POLL_MS);
-    return () => clearInterval(id);
-  }, []);
+  function handleManualRefetch() { fetchData(selectedDuration, chartType, true); }
 
-  // ── Derived ───────────────────────────────────────────────────────────────
+  // ── Derived values ──────────────────────────────────────────────────────────
 
   const isCandle = chartType === "candle";
   const prec     = currentPrice ? precision(currentPrice) : 6;
 
-  const prices = isCandle
+  const allPrices = isCandle
     ? (chartData as CandlePoint[]).flatMap((d) => [d.high, d.low])
     : (chartData as LinePoint[]).map((d) => d.price);
 
-  const minP = prices.length ? Math.min(...prices) * 0.999 : 0;
-  const maxP = prices.length ? Math.max(...prices) * 1.001 : 1;
+  const minP = allPrices.length ? safeMin(allPrices) * 0.999 : 0;
+  const maxP = allPrices.length ? safeMax(allPrices) * 1.001 : 1;
 
-  const lastTwo = chartData.slice(-2);
+  const lastTwo    = chartData.slice(-2);
   const trendDelta = lastTwo.length === 2
-    ? (isCandle
-        ? (lastTwo[1] as CandlePoint).close - (lastTwo[0] as CandlePoint).close
-        : (lastTwo[1] as LinePoint).price   - (lastTwo[0] as LinePoint).price)
+    ? isCandle
+      ? (lastTwo[1] as CandlePoint).close - (lastTwo[0] as CandlePoint).close
+      : (lastTwo[1] as LinePoint).price   - (lastTwo[0] as LinePoint).price
     : 0;
-
   const trend      = trendDelta > 0 ? "up" : trendDelta < 0 ? "down" : "flat";
   const TrendIcon  = trend === "up" ? TrendingUp : trend === "down" ? TrendingDown : Minus;
   const trendColor = trend === "up" ? "text-emerald-400" : trend === "down" ? "text-red-400" : "text-white/40";
 
-  const cfg         = DURATIONS[selectedDuration];
-  const chartHeight = isFullscreen ? "calc(100vh - 160px)" : 240;
+  const cfg = DURATIONS[selectedDuration];
+
+  const chartPxHeight = isFullscreen ? Math.max(fsHeight - 150, 300) : 240;
+
+  // Give each bar/point a minimum pixel width so the chart is always scrollable.
+  // Candles need more horizontal space than line points.
+  const minBarPx  = isCandle ? 12 : 4;
+  const chartWidth = Math.max(900, chartData.length * minBarPx);
 
   const axisProps = {
-    tick:      { fill: "rgba(255,255,255,0.3)", fontSize: 10 },
-    tickLine:  false as const,
-    axisLine:  false as const,
+    tick:     { fill: "rgba(255,255,255,0.3)", fontSize: 10 },
+    tickLine: false as const,
+    axisLine: false as const,
   };
 
   const tooltipStyle = {
@@ -404,19 +325,23 @@ export default function PriceChart() {
     labelStyle: { color: "rgba(255,255,255,0.5)" },
   };
 
-  // ─── Render chart body ───────────────────────────────────────────────────────
+  // ── Chart render ────────────────────────────────────────────────────────────
 
   function renderChart() {
-    if (loading) return <Skeleton className="w-full bg-white/10 rounded-lg" style={{ height: chartHeight }} />;
+    if (loading) {
+      return (
+        <div style={{ height: chartPxHeight }}>
+          <Skeleton className="w-full h-full bg-white/10 rounded-lg" />
+        </div>
+      );
+    }
 
-    const shared = {
-      data: chartData,
-      margin: { top: 4, right: 8, left: 0, bottom: 0 },
-    };
+    const shared = { data: chartData, margin: { top: 4, right: 8, left: 0, bottom: 0 } };
 
-    const xAxis = (
-      <XAxis dataKey="time" {...axisProps} interval="preserveStartEnd" />
-    );
+    // Show ~10 evenly-spaced x-axis labels regardless of total point count.
+    const tickInterval = Math.max(1, Math.floor(chartData.length / 10)) - 1;
+
+    const xAxis = <XAxis dataKey="time" {...axisProps} interval={tickInterval} minTickGap={50} />;
     const yAxis = (
       <YAxis
         domain={[minP, maxP]}
@@ -427,84 +352,76 @@ export default function PriceChart() {
     );
     const grid = <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.06)" />;
 
+    // Scrollable wrapper — plain div gives us direct control of scrollLeft.
+    const wrap = (inner: React.ReactNode) => (
+      <div
+        ref={scrollRef}
+        className="overflow-x-auto w-full rounded-lg"
+        style={{ scrollbarWidth: "thin", scrollbarColor: "rgba(255,255,255,0.15) transparent" }}
+      >
+        <div style={{ width: chartWidth, height: chartPxHeight }}>
+          <ResponsiveContainer width="100%" height="100%">
+            {inner as React.ReactElement}
+          </ResponsiveContainer>
+        </div>
+      </div>
+    );
+
     if (chartType === "line") {
-      return (
-        <ResponsiveContainer width="100%" height={chartHeight}>
-          <LineChart {...shared}>
-            {grid}{xAxis}{yAxis}
-            <Tooltip
-              {...tooltipStyle}
-              formatter={(v: number) => [`$${v.toFixed(prec)}`, "CKB"]}
-            />
-            <Line
-              type="monotone"
-              dataKey="price"
-              stroke="#22d3ee"
-              strokeWidth={2}
-              dot={false}
-              activeDot={{ r: 4, fill: "#22d3ee" }}
-            />
-          </LineChart>
-        </ResponsiveContainer>
+      return wrap(
+        <LineChart {...shared}>
+          {grid}{xAxis}{yAxis}
+          <Tooltip {...tooltipStyle} formatter={(v: number) => [`$${v.toFixed(prec)}`, "CKB"]} />
+          <Line
+            type="monotone" dataKey="price" stroke="#22d3ee"
+            strokeWidth={1.5} dot={false} activeDot={{ r: 3, fill: "#22d3ee" }}
+          />
+        </LineChart>
       );
     }
 
     if (chartType === "area") {
-      return (
-        <ResponsiveContainer width="100%" height={chartHeight}>
-          <AreaChart {...shared}>
-            <defs>
-              <linearGradient id="ckbGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%"  stopColor="#22d3ee" stopOpacity={0.25} />
-                <stop offset="95%" stopColor="#22d3ee" stopOpacity={0.02} />
-              </linearGradient>
-            </defs>
-            {grid}{xAxis}{yAxis}
-            <Tooltip
-              {...tooltipStyle}
-              formatter={(v: number) => [`$${v.toFixed(prec)}`, "CKB"]}
-            />
-            <Area
-              type="monotone"
-              dataKey="price"
-              stroke="#22d3ee"
-              strokeWidth={2}
-              fill="url(#ckbGrad)"
-              dot={false}
-              activeDot={{ r: 4, fill: "#22d3ee" }}
-            />
-          </AreaChart>
-        </ResponsiveContainer>
+      return wrap(
+        <AreaChart {...shared}>
+          <defs>
+            <linearGradient id="ckbGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%"  stopColor="#22d3ee" stopOpacity={0.25} />
+              <stop offset="95%" stopColor="#22d3ee" stopOpacity={0.02} />
+            </linearGradient>
+          </defs>
+          {grid}{xAxis}{yAxis}
+          <Tooltip {...tooltipStyle} formatter={(v: number) => [`$${v.toFixed(prec)}`, "CKB"]} />
+          <Area
+            type="monotone" dataKey="price" stroke="#22d3ee"
+            strokeWidth={1.5} fill="url(#ckbGrad)" dot={false}
+            activeDot={{ r: 3, fill: "#22d3ee" }}
+          />
+        </AreaChart>
       );
     }
 
-    // Candle
-    return (
-      <ResponsiveContainer width="100%" height={chartHeight}>
-        <ComposedChart {...shared}>
-          {grid}{xAxis}
-          <YAxis
-            domain={[minP, maxP]}
-            {...axisProps}
-            tickFormatter={(v) => `$${v.toFixed(prec)}`}
-            width={78}
-          />
-          <Tooltip content={<CandleTooltip prec={prec} />} />
-          {/*
-            dataKey="high" ensures the bar slot spans the full candle range.
-            shape as render function guarantees all props (incl. yAxis.scale) are forwarded.
-            fill/stroke transparent so recharts default bar rect is invisible.
-          */}
-          <Bar
-            dataKey="high"
-            shape={(props: any) => <CandlestickBar {...props} />}
-            isAnimationActive={false}
-            fill="transparent"
-            stroke="transparent"
-            background={{ fill: "transparent" }}
-          />
-        </ComposedChart>
-      </ResponsiveContainer>
+    // ── Candlestick ────────────────────────────────────────────────────────────
+    // Re-create the shape factory on every render so it closes over fresh minP/maxP.
+    const candleShape = makeCandlestickShape(minP, maxP);
+
+    return wrap(
+      <ComposedChart {...shared}>
+        {grid}{xAxis}
+        <YAxis
+          domain={[minP, maxP]}
+          {...axisProps}
+          tickFormatter={(v) => `$${v.toFixed(prec)}`}
+          width={78}
+        />
+        <Tooltip content={<CandleTooltip prec={prec} />} cursor={{ fill: "rgba(255,255,255,0.04)" }} />
+        <Bar
+          dataKey="high"
+          shape={candleShape}
+          isAnimationActive={false}
+          fill="transparent"
+          stroke="transparent"
+        />
+      </ComposedChart>
     );
   }
 
@@ -513,64 +430,54 @@ export default function PriceChart() {
   return (
     <div
       ref={containerRef}
-      className={isFullscreen ? "bg-[#0d0d1a] p-6 flex flex-col" : ""}
+      style={isFullscreen
+        ? { height: "100vh", background: "#0d0d1a", padding: "24px", display: "flex", flexDirection: "column" }
+        : undefined}
     >
-      <Card className="bg-white/5 border-white/10 text-white flex flex-col flex-1">
+      <Card
+        className="bg-white/5 border-white/10 text-white"
+        style={isFullscreen ? { flex: 1, display: "flex", flexDirection: "column" } : undefined}
+      >
         <CardHeader className="pb-2">
-          {/* Row 1: title + price + fullscreen */}
+          {/* Row 1: title + price + controls */}
           <div className="flex items-center justify-between flex-wrap gap-2">
-            <CardTitle className="text-base font-semibold text-white/80">
-              CKB / USD
-            </CardTitle>
+            <CardTitle className="text-base font-semibold text-white/80">CKB / USD</CardTitle>
 
             <div className="flex items-center gap-2 flex-wrap">
               {loading && !refetching ? (
                 <Skeleton className="h-6 w-24 bg-white/10" />
               ) : error ? (
-                <div className="flex items-center gap-1.5">
-                  <Badge variant="destructive" className="text-xs max-w-[160px] truncate">
-                    {error}
-                  </Badge>
-                </div>
+                <Badge variant="destructive" className="text-xs max-w-[160px] truncate">{error}</Badge>
               ) : (
                 <div className="flex items-center gap-1.5">
                   <TrendIcon className={`w-4 h-4 ${trendColor}`} />
-                  <span className="text-lg font-bold text-cyan-300">
-                    ${currentPrice?.toFixed(prec)}
-                  </span>
+                  <span className="text-lg font-bold text-cyan-300">${currentPrice?.toFixed(prec)}</span>
                 </div>
               )}
 
-              <Badge variant="outline" className="text-[10px] border-white/20 text-white/40">
-                CoinGecko
-              </Badge>
+              <Badge variant="outline" className="text-[10px] border-white/20 text-white/40">CoinGecko</Badge>
 
-              {/* Refetch button */}
               <button
                 onClick={handleManualRefetch}
-                disabled={refetching}
-                title="Refetch price data"
-                className="flex items-center justify-center w-7 h-7 rounded-md border border-white/10 bg-white/5 hover:bg-white/10 text-white/50 hover:text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                disabled={refetching || loading}
+                title="Refetch"
+                className="flex items-center justify-center w-7 h-7 rounded-md border border-white/10 bg-white/5 hover:bg-white/10 text-white/50 hover:text-white transition-colors disabled:opacity-40"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${refetching ? "animate-spin" : ""}`} />
               </button>
 
-              {/* Fullscreen button */}
               <button
                 onClick={toggleFullscreen}
                 title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
                 className="flex items-center justify-center w-7 h-7 rounded-md border border-white/10 bg-white/5 hover:bg-white/10 text-white/50 hover:text-white transition-colors"
               >
-                {isFullscreen
-                  ? <Minimize2 className="w-3.5 h-3.5" />
-                  : <Maximize2 className="w-3.5 h-3.5" />}
+                {isFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
               </button>
             </div>
           </div>
 
-          {/* Row 2: chart type + duration selectors */}
+          {/* Row 2: chart type + duration */}
           <div className="flex items-center gap-2 flex-wrap mt-2">
-            {/* Chart type */}
             <div className="flex items-center gap-0.5 rounded-lg border border-white/10 bg-white/5 p-0.5">
               {CHART_TYPES.map(({ key, label, Icon }) => (
                 <button
@@ -588,7 +495,6 @@ export default function PriceChart() {
               ))}
             </div>
 
-            {/* Duration */}
             <div className="flex items-center gap-0.5 rounded-lg border border-white/10 bg-white/5 p-0.5">
               {DURATION_KEYS.map((key) => (
                 <button
@@ -607,13 +513,16 @@ export default function PriceChart() {
           </div>
         </CardHeader>
 
-        <CardContent className="pt-0 flex-1">
+        <CardContent
+          className="pt-0"
+          style={isFullscreen ? { flex: 1, display: "flex", flexDirection: "column" } : undefined}
+        >
           {renderChart()}
-          <p className="text-[10px] text-white/20 mt-1.5 text-right">
-            {cfg.live
-              ? `Live · updates every 60s · ${chartData.length} points`
-              : `Historical · ${chartData.length} ${isCandle ? "candles" : "points"} · refreshes on switch`}
-          </p>
+          {!loading && (
+            <p className="text-[10px] text-white/20 mt-1.5 text-right">
+              {cfg.description} · {chartData.length} {isCandle ? "candles" : "points"}
+            </p>
+          )}
         </CardContent>
       </Card>
     </div>

@@ -5,51 +5,69 @@ const client = new Anthropic({
     apiKey: process.env.ANTHROPIC_API_KEY!,
 });
 
+const STOP_LOSS_PCT = 5; // realise the loss if price falls ≥5% below buy price
+
 export async function getAgentDecision(
     ctx: AgentContext
 ): Promise<AgentDecisionResult> {
     const priceTrend = describeTrend(ctx.recentPrices);
     const distanceToBuy = (
-        ((ctx.currentPrice - ctx.likelyBuyPrice) / ctx.likelyBuyPrice) *
-        100
+        ((ctx.currentPrice - ctx.likelyBuyPrice) / ctx.likelyBuyPrice) * 100
     ).toFixed(2);
     const distanceToSell = (
-        ((ctx.likelySellPrice - ctx.currentPrice) / ctx.currentPrice) *
-        100
+        ((ctx.likelySellPrice - ctx.currentPrice) / ctx.currentPrice) * 100
     ).toFixed(2);
 
-    const prompt = `You are CAIT, an AI trading agent for CKB (Nervos Network) on testnet.
-                                                                                                                                 
-  Current market context:                                                                                                        
-  - Current CKB price: $${ctx.currentPrice.toFixed(6)} USD
-  - Target BUY price: $${ctx.likelyBuyPrice.toFixed(6)} USD (${distanceToBuy}% away)                                             
-  - Target SELL price: $${ctx.likelySellPrice.toFixed(6)} USD (${distanceToSell}% above current)                                 
-  - Price trend (last ${ctx.recentPrices.length} readings): ${priceTrend}                                                        
-  - Recent prices: ${ctx.recentPrices.slice(-5).map((p) => `$${p.toFixed(6)}`).join(", ")}                                       
-  - Remaining capital: ${ctx.remainingCapital.toFixed(2)} CKB                                                                    
-  - Max per trade: ${ctx.maxPerTrade.toFixed(2)} CKB                                                                             
-  - Consecutive losses: ${ctx.consecutiveLosses}                                                                                 
-  - Last decision: ${ctx.lastDecision ?? "none"}
+    // ── Open position summary ─────────────────────────────────────────────────
+    let positionBlock = "  - Open position: none";
+    if (ctx.lastBuyPrice !== null && ctx.lastBuyAmount !== null) {
+        const unrealisedPct =
+            ((ctx.currentPrice - ctx.lastBuyPrice) / ctx.lastBuyPrice) * 100;
+        const unrealisedCkb =
+            ctx.lastBuyAmount * (ctx.currentPrice - ctx.lastBuyPrice) / ctx.currentPrice;
+        const sign = unrealisedPct >= 0 ? "+" : "";
+        positionBlock =
+            `  - Open position: ${ctx.lastBuyAmount.toFixed(2)} CKB bought @ $${ctx.lastBuyPrice.toFixed(6)}\n` +
+            `  - Unrealised P&L: ${sign}${unrealisedPct.toFixed(2)}% (${sign}${unrealisedCkb.toFixed(2)} CKB)\n` +
+            `  - Stop-loss threshold: -${STOP_LOSS_PCT}% below buy price` +
+            ` ($${(ctx.lastBuyPrice * (1 - STOP_LOSS_PCT / 100)).toFixed(6)})`;
+    }
 
-  Trading window rule: Only act if price is within ±25% of the target buy or sell price.                                         
-  - Buy window: $${(ctx.likelyBuyPrice * 0.75).toFixed(6)} – $${(ctx.likelyBuyPrice * 1.25).toFixed(6)}
-  - Sell window: $${(ctx.likelySellPrice * 0.75).toFixed(6)} – $${(ctx.likelySellPrice * 1.25).toFixed(6)}                       
-                                                                                                                                 
-  Respond with a JSON object only — no markdown, no explanation outside the JSON:                                                
-  {                                                                                                                              
-    "decision": "buy_now" | "buy_early" | "sell_now" | "sell_early" | "wait" | "hold",                                           
-    "reason": "<one concise sentence explaining why, max 100 chars>",                                                            
-    "confidence": <integer 0-100>                                                                                                
-  }                                                                                                                              
-                                                                                                                                 
-  Rules:                                                                                                                         
-  - "buy_now": price is at or below buy target, strong signal
-  - "buy_early": price is approaching buy target (within window), momentum favors buying soon                                    
-  - "sell_now": price is at or above sell target, strong signal
-  - "sell_early": price is approaching sell target (within window), momentum favors selling soon
+    const prompt = `You are CAIT, an AI trading agent for CKB (Nervos Network) on testnet.
+
+  Current market context:
+  - Current CKB price: $${ctx.currentPrice.toFixed(6)} USD
+  - Target BUY price:  $${ctx.likelyBuyPrice.toFixed(6)} USD (${distanceToBuy}% away)
+  - Target SELL price: $${ctx.likelySellPrice.toFixed(6)} USD (${distanceToSell}% above current)
+  - Price trend (last ${ctx.recentPrices.length} readings): ${priceTrend}
+  - Recent prices: ${ctx.recentPrices.slice(-5).map((p) => `$${p.toFixed(6)}`).join(", ")}
+  - Remaining capital: ${ctx.remainingCapital.toFixed(2)} CKB
+  - Max per trade: ${ctx.maxPerTrade.toFixed(2)} CKB
+  - Consecutive losses: ${ctx.consecutiveLosses}
+  - Last decision: ${ctx.lastDecision ?? "none"}
+${positionBlock}
+
+  Trading window rule: Only act if price is within ±25% of the target buy or sell price.
+  - Buy window:  $${(ctx.likelyBuyPrice * 0.75).toFixed(6)} – $${(ctx.likelyBuyPrice * 1.25).toFixed(6)}
+  - Sell window: $${(ctx.likelySellPrice * 0.75).toFixed(6)} – $${(ctx.likelySellPrice * 1.25).toFixed(6)}
+
+  Respond with a JSON object only — no markdown, no explanation outside the JSON:
+  {
+    "decision": "buy_now" | "buy_early" | "sell_now" | "sell_early" | "wait" | "hold",
+    "reason": "<one concise sentence explaining why, max 100 chars>",
+    "confidence": <integer 0-100>
+  }
+
+  Rules:
+  - "buy_now":   price is at or below buy target, strong signal — only when NO open position
+  - "buy_early": price is approaching buy target (within window), momentum favors buying — only when NO open position
+  - "sell_now":  price is at or above sell target, strong signal
+  - "sell_early": price is approaching sell target (within window), momentum favors selling
   - "wait": price is outside both windows, do nothing
-  - "hold": inside a window but conditions are unclear, preserve capital                                                         
+  - "hold": inside a window but conditions are unclear, preserve capital
+  - STOP-LOSS RULE: if an open position exists AND current price has fallen ≥${STOP_LOSS_PCT}% below the buy price, you MUST return "sell_now" to cut the loss — do not hold a deeply losing position
   - If remaining capital < 10 CKB, always return "hold"
+  - Never open a new buy position while another is already open
   - Be concise and decisive`;
 
     const message = await client.messages.create({

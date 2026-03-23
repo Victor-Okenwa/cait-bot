@@ -78,16 +78,14 @@ export default function Home() {
         <PriceChart />
 
         {/* Agent controls + Trade log — 2 col on large screens */}
-        <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
-          <div className="lg:col-span-2 flex flex-col gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
             <AgentControls />
             <AgentStats />
-          </div>
-          <div className="lg:col-span-3">
-            <TradeLog />
-          </div>
         </div>
 
+          <div className="">
+            <TradeLog />
+          </div>
       </main>
 
       {/* ── Footer ── */}
