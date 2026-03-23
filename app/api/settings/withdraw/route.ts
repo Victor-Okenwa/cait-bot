@@ -74,7 +74,7 @@ export async function POST(req: NextRequest) {
     let cursor: string | null = null;
 
     do {
-        const res = await fetch(RPC_URL, {
+        const res: Response = await fetch(RPC_URL, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -99,7 +99,7 @@ export async function POST(req: NextRequest) {
             }),
         });
 
-        const json = await res.json();
+        const json: { result?: { objects?: RpcCell[]; last_cursor?: string } } = await res.json();
         const { objects, last_cursor } = json.result ?? {};
         if (!objects?.length) break;
         liveCells.push(...objects);

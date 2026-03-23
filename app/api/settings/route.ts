@@ -51,6 +51,15 @@ export async function POST(req: NextRequest) {
         max_per_trade: body.max_per_trade ?? 0,
         is_running: body.is_running ?? false,
         updated_at: new Date().toISOString(),
+        // Position tracking
+        capital_in_trading: 0,
+        last_buy_price: null,
+        last_buy_amount: null,
+        win_count: 0,
+        loss_count: 0,
+        martingale_count: 0,
+        total_pnl_ckb: 0,
+        pending_pnl_ckb: 0
     };
 
     const db = createServiceClient();
