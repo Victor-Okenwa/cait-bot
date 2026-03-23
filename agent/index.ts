@@ -25,9 +25,6 @@ import { getAddressBalanceCKB } from "@/lib/balance";
 import { maybeRefillReserve, sendProfitToUser, collectLossFromUser } from "@/lib/reserve";
 import type { AgentSettings, AgentState, TradeDecision, TradingAddress } from "@/agent/types";
 
-const INTERVAL_MS = 60_000;
-const EXPLORER_BASE = "https://testnet.explorer.nervos.org/transaction";
-
 // ─── Bootstrap ───────────────────────────────────────────────────────────────
 
 const testnetClient = new ccc.ClientPublicTestnet();

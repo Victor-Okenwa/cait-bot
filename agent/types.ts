@@ -22,20 +22,6 @@ export type AgentContext = {
     lastBuyAmount: number | null;
 };
 
-export type TradeRecord = {
-    wallet_address: string;
-    type: "buy" | "sell" | "hold" | "wait";
-    amount: number;
-    price: number;
-    reason: string;
-    martingale: boolean;
-    tx_hash?: string;
-    explorer_link?: string;
-    pnl_ckb?: number;          // profit/loss in CKB (null for buy/hold/wait)
-    pnl_usd?: number;          // profit/loss in USD
-    profit_tx_hash?: string;   // on-chain tx hash of profit payout to owner
-};
-
 export type TradingAddress = {
     address: string;
     private_key: string;
