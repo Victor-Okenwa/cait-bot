@@ -299,7 +299,7 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
         let txStatus: string | undefined;
         try {
             const txRecord = await testnetClient.getTransaction(agentState.lastBuyTxHash);
-            txStatus = txRecord?.txStatus?.status;
+            txStatus = txRecord?.status;
         } catch {
             txStatus = undefined;
         }
