@@ -5,6 +5,7 @@
  * Requires env vars (add to .env.local):
  *   SUPABASE_SERVICE_ROLE_KEY=...   (for DB writes)
  *   GROQ_API_KEY=...                (for Groq/Llama trading decisions)
+ *   GROQ_API_KEY2..4=...            (optional extra keys for rotation)
  *
  * Each user's trades are signed by their own dedicated trading wallet
  * (stored in agent_settings.trading_address). No shared agent key needed.
@@ -13,7 +14,8 @@
 import { ccc } from "@ckb-ccc/core";
 import { createServiceClient } from "@/lib/supabase";
 import { fetchAndRecordPrice, getPriceHistory } from "@/lib/price";
-import { getAgentDecision } from "@/lib/agent-decision";
+import { getAgentDecision, AllKeysRateLimitedError } from "@/lib/agent-decision";
+import { getRuleBasedDecision } from "@/lib/rule-decision";
 import {
     calculateTradeSize,
     initialMartingaleState,
@@ -192,31 +194,51 @@ async function processWallet(settings: AgentSettings, currentPrice: number) {
         }
     }
 
-    // Ask Groq/Llama for decision
+    // ── Decision: rule engine first, then AI, then conservative fallback ────
     const recentPrices = getPriceHistory().map((p) => p.price);
-    let aiResult;
-    try {
-        aiResult = await getAgentDecision({
-            currentPrice,
-            likelyBuyPrice: settings.likely_buy_price,
-            likelySellPrice: settings.likely_sell_price,
-            totalCapital: settings.total_capital,
-            remainingCapital: agentState.remainingCapital,
-            maxPerTrade: settings.max_per_trade,
-            lastDecision: agentState.lastDecision,
-            consecutiveLosses: agentState.consecutiveLosses,
-            recentPrices,
-            lastBuyPrice:  agentState.lastBuyPrice,
-            lastBuyAmount: agentState.lastBuyAmount,
-        });
-    } catch (err) {
-        console.error("❌  AI call failed:", err);
-        return;
-    }
+    const decisionCtx = {
+        currentPrice,
+        likelyBuyPrice: settings.likely_buy_price,
+        likelySellPrice: settings.likely_sell_price,
+        totalCapital: settings.total_capital,
+        remainingCapital: agentState.remainingCapital,
+        maxPerTrade: settings.max_per_trade,
+        lastDecision: agentState.lastDecision,
+        consecutiveLosses: agentState.consecutiveLosses,
+        recentPrices,
+        lastBuyPrice:  agentState.lastBuyPrice,
+        lastBuyAmount: agentState.lastBuyAmount,
+    };
 
-    console.log(
-        `🤖  Decision: ${aiResult.decision} (${aiResult.confidence}%) — ${aiResult.reason}`
-    );
+    let aiResult = getRuleBasedDecision(decisionCtx);
+
+    if (aiResult) {
+        console.log(
+            `📐  Rule decision: ${aiResult.decision} (${aiResult.confidence}%) — ${aiResult.reason}`
+        );
+    } else {
+        try {
+            aiResult = await getAgentDecision(decisionCtx);
+            console.log(
+                `🤖  AI decision: ${aiResult.decision} (${aiResult.confidence}%) — ${aiResult.reason}`
+            );
+        } catch (err) {
+            if (err instanceof AllKeysRateLimitedError) {
+                console.warn("⚠️   All Groq API keys rate-limited — using conservative fallback.");
+            } else {
+                console.error("❌  AI call failed:", err);
+            }
+            const hasPos = agentState.lastBuyPrice !== null && agentState.capitalInTrading > 0;
+            aiResult = {
+                decision: hasPos ? "hold" as const : "wait" as const,
+                reason: "Fallback: AI unavailable",
+                confidence: 0,
+            };
+            console.log(
+                `🔄  Fallback decision: ${aiResult.decision} — ${aiResult.reason}`
+            );
+        }
+    }
 
     let { decision, reason } = aiResult;
     agentState.lastDecision = decision as TradeDecision;

@@ -1,15 +1,148 @@
 import Groq from "groq-sdk";
 import type { AgentContext, AgentDecisionResult, TradeDecision } from "@/agent/types";
 
-const client = new Groq({
-    apiKey: process.env.GROQ_API_KEY!,
-});
+// ─── Multi-key client pool ──────────────────────────────────────────────────
 
-const STOP_LOSS_PCT = 5; // realise the loss if price falls ≥5% below buy price
+type KeySlot = {
+    client: Groq;
+    rateLimitedUntil: number;
+    label: string;
+};
+
+const keySlots: KeySlot[] = [];
+
+const KEY_NAMES = [
+    "GROQ_API_KEY",
+    "GROQ_API_KEY2",
+    "GROQ_API_KEY3",
+    "GROQ_API_KEY4",
+];
+
+for (const name of KEY_NAMES) {
+    const apiKey = process.env[name];
+    if (apiKey) {
+        keySlots.push({
+            client: new Groq({ apiKey }),
+            rateLimitedUntil: 0,
+            label: name,
+        });
+    }
+}
+
+if (keySlots.length === 0) {
+    throw new Error("No GROQ_API_KEY* environment variables found.");
+}
+
+let roundRobinIndex = 0;
+
+export class AllKeysRateLimitedError extends Error {
+    constructor() {
+        super("All Groq API keys are rate-limited");
+        this.name = "AllKeysRateLimitedError";
+    }
+}
+
+function pickNextSlot(): KeySlot | null {
+    const now = Date.now();
+    const len = keySlots.length;
+    for (let i = 0; i < len; i++) {
+        const idx = (roundRobinIndex + i) % len;
+        if (keySlots[idx].rateLimitedUntil <= now) {
+            roundRobinIndex = (idx + 1) % len;
+            return keySlots[idx];
+        }
+    }
+    return null;
+}
+
+function markRateLimited(slot: KeySlot, retryAfterSec: number) {
+    const cooldown = Math.max(retryAfterSec, 60) * 1000;
+    slot.rateLimitedUntil = Date.now() + cooldown;
+    console.warn(
+        `⚠️   Key ${slot.label} rate-limited — cooldown ${Math.round(cooldown / 1000)}s`
+    );
+}
+
+// ─── Decision logic ─────────────────────────────────────────────────────────
+
+const STOP_LOSS_PCT = 5;
 
 export async function getAgentDecision(
     ctx: AgentContext
 ): Promise<AgentDecisionResult> {
+    const prompt = buildPrompt(ctx);
+
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < keySlots.length; attempt++) {
+        const slot = pickNextSlot();
+        if (!slot) break;
+
+        try {
+            const completion = await slot.client.chat.completions.create({
+                model: "llama-3.3-70b-versatile",
+                max_tokens: 128,
+                response_format: { type: "json_object" },
+                messages: [{ role: "user", content: prompt }],
+            });
+
+            const raw = completion.choices[0]?.message?.content?.trim() ?? "";
+            return parseResponse(raw);
+        } catch (err: unknown) {
+            lastError = err;
+            const status = (err as { status?: number }).status;
+            if (status === 429) {
+                const retryAfter = parseRetryAfter(err);
+                markRateLimited(slot, retryAfter);
+                continue;
+            }
+            throw err;
+        }
+    }
+
+    if (pickNextSlot() === null) {
+        throw new AllKeysRateLimitedError();
+    }
+
+    throw lastError;
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+function parseRetryAfter(err: unknown): number {
+    try {
+        const headers = (err as { headers?: Headers }).headers;
+        const raw = headers?.get?.("retry-after");
+        if (raw) {
+            const n = Number(raw);
+            if (!isNaN(n)) return n;
+        }
+    } catch { /* ignore */ }
+    return 300;
+}
+
+function parseResponse(raw: string): AgentDecisionResult {
+    try {
+        const parsed = JSON.parse(raw) as {
+            decision: TradeDecision;
+            reason: string;
+            confidence: number;
+        };
+        return {
+            decision: parsed.decision,
+            reason: parsed.reason ?? "No reason provided",
+            confidence: Math.min(100, Math.max(0, parsed.confidence ?? 50)),
+        };
+    } catch {
+        return {
+            decision: "wait",
+            reason: "Could not parse AI response — defaulting to wait",
+            confidence: 0,
+        };
+    }
+}
+
+function buildPrompt(ctx: AgentContext): string {
     const priceTrend = describeTrend(ctx.recentPrices);
     const distanceToBuy = (
         ((ctx.currentPrice - ctx.likelyBuyPrice) / ctx.likelyBuyPrice) * 100
@@ -18,7 +151,6 @@ export async function getAgentDecision(
         ((ctx.likelySellPrice - ctx.currentPrice) / ctx.currentPrice) * 100
     ).toFixed(2);
 
-    // ── Open position summary ─────────────────────────────────────────────────
     let positionBlock = "  - Open position: none";
     if (ctx.lastBuyPrice !== null && ctx.lastBuyAmount !== null) {
         const unrealisedPct =
@@ -33,7 +165,7 @@ export async function getAgentDecision(
             ` ($${(ctx.lastBuyPrice * (1 - STOP_LOSS_PCT / 100)).toFixed(6)})`;
     }
 
-    const prompt = `You are CAIT, an AI trading agent for CKB (Nervos Network) on testnet.
+    return `You are CAIT, an AI trading agent for CKB (Nervos Network) on testnet.
 
   Current market context:
   - Current CKB price: $${ctx.currentPrice.toFixed(6)} USD
@@ -69,36 +201,6 @@ ${positionBlock}
   - If remaining capital < 10 CKB, always return "hold"
   - Never open a new buy position while another is already open
   - Be concise and decisive`;
-
-    const completion = await client.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
-        max_tokens: 256,
-        response_format: { type: "json_object" },
-        messages: [{ role: "user", content: prompt }],
-    });
-
-    const raw = completion.choices[0]?.message?.content?.trim() ?? "";
-
-    try {
-        const parsed = JSON.parse(raw) as {
-            decision: TradeDecision;
-            reason: string;
-            confidence: number;
-        };
-
-        return {
-            decision: parsed.decision,
-            reason: parsed.reason ?? "No reason provided",
-            confidence: Math.min(100, Math.max(0, parsed.confidence ?? 50)),
-        };
-    } catch {
-        // Fallback if the model returns malformed JSON
-        return {
-            decision: "wait",
-            reason: "Could not parse AI response — defaulting to wait",
-            confidence: 0,
-        };
-    }
 }
 
 function describeTrend(prices: number[]): string {
@@ -109,4 +211,4 @@ function describeTrend(prices: number[]): string {
     if (change > 1) return `uptrend (+${change.toFixed(2)}%)`;
     if (change < -1) return `downtrend (${change.toFixed(2)}%)`;
     return `sideways (${change.toFixed(2)}%)`;
-}           
+}
